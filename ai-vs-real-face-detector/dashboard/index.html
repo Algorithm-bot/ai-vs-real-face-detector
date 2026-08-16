@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AI vs Real Face Detector</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 900px; margin: 2rem auto; padding: 0 1rem; }
+    .card { border: 1px solid #ddd; border-radius: 8px; padding: 1.5rem; margin-top: 1rem; }
+    .result { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+    img { max-width: 100%; border-radius: 8px; border: 1px solid #eee; }
+    .badge { display: inline-block; padding: 0.25rem 0.75rem; border-radius: 999px; font-weight: 600; }
+    .badge.real { background: #d1fae5; color: #065f46; }
+    .badge.ai { background: #fee2e2; color: #991b1b; }
+    button { background: #2563eb; color: white; border: none; padding: 0.6rem 1.2rem; border-radius: 6px; cursor: pointer; }
+    button:disabled { opacity: 0.6; cursor: not-allowed; }
+    pre { background: #f8fafc; padding: 1rem; overflow: auto; border-radius: 6px; }
+  </style>
+</head>
+<body>
+  <h1>AI vs Real Face Detector</h1>
+  <p>Upload a portrait image to classify via the hybrid model API.</p>
+
+  <div class="card">
+    <input type="file" id="file" accept="image/jpeg,image/png,image/webp" />
+    <button id="submit" style="margin-left: 0.5rem">Analyze</button>
+    <p id="status"></p>
+  </div>
+
+  <div class="card result" id="results" style="display:none">
+    <div>
+      <h3>Prediction</h3>
+      <p>Label: <span id="label" class="badge"></span></p>
+      <p>Confidence: <strong id="confidence"></strong>%</p>
+      <pre id="probs"></pre>
+    </div>
+    <div>
+      <h3>Grad-CAM Heatmap</h3>
+      <img id="heatmap" alt="Grad-CAM heatmap" />
+    </div>
+  </div>
+
+  <script>
+    const submit = document.getElementById('submit');
+    const fileInput = document.getElementById('file');
+    const status = document.getElementById('status');
+    const results = document.getElementById('results');
+
+    submit.addEventListener('click', async () => {
+      const file = fileInput.files[0];
+      if (!file) { status.textContent = 'Select an image first.'; return; }
+
+      submit.disabled = true;
+      status.textContent = 'Running inference...';
+      results.style.display = 'none';
+
+      const form = new FormData();
+      form.append('file', file);
+
+      try {
+        const res = await fetch('/api/v1/predict', { method: 'POST', body: form });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || 'Request failed');
+
+        document.getElementById('label').textContent = data.label;
+        document.getElementById('label').className = 'badge ' + data.label;
+        document.getElementById('confidence').textContent = data.confidence_score;
+        document.getElementById('probs').textContent = JSON.stringify(data.probability_distribution, null, 2);
+
+        const heatmap = document.getElementById('heatmap');
+        if (data.heatmap) {
+          heatmap.src = 'data:image/png;base64,' + data.heatmap;
+          heatmap.style.display = 'block';
+        } else {
+          heatmap.style.display = 'none';
+          status.textContent = data.heatmap_error || 'Heatmap unavailable.';
+        }
+
+        results.style.display = 'grid';
+        status.textContent = 'Done.';
+      } catch (err) {
+        status.textContent = 'Error: ' + err.message;
+      } finally {
+        submit.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>

@@ -1,0 +1,20 @@
+﻿# Python virtual envs and caches
+ai-vs-real-face-detector/venv/
+ai-vs-real-face-detector/.venv/
+**/__pycache__/
+**/*.py[cod]
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+**/.ipynb_checkpoints/
+
+# Local env files
+.env
+.env.*
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+
+# Build / generated output
+ai-vs-real-face-detector/debug_out/

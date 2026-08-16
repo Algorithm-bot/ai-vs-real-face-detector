@@ -1,0 +1,50 @@
+Looking in indexes: https://pypi.org/simple, https://pypi.ngc.nvidia.com
+Collecting grad-cam
+  Downloading grad-cam-1.5.5.tar.gz (7.8 MB)
+     ---------------------------------------- 7.8/7.8 MB 3.9 MB/s eta 0:00:00
+  Installing build dependencies: started
+  Installing build dependencies: finished with status 'done'
+  Getting requirements to build wheel: started
+  Getting requirements to build wheel: finished with status 'done'
+  Preparing metadata (pyproject.toml): started
+  Preparing metadata (pyproject.toml): finished with status 'done'
+Collecting numpy (from grad-cam)
+  Downloading numpy-2.5.2-cp312-cp312-win_amd64.whl.metadata (6.6 kB)
+Collecting Pillow (from grad-cam)
+  Downloading pillow-12.3.0-cp312-cp312-win_amd64.whl.metadata (9.3 kB)
+Collecting torch>=1.7.1 (from grad-cam)
+  Downloading torch-2.13.0-cp312-cp312-win_amd64.whl.metadata (39 kB)
+Collecting torchvision>=0.8.2 (from grad-cam)
+  Downloading torchvision-0.28.0-cp312-cp312-win_amd64.whl.metadata (5.6 kB)
+Collecting ttach (from grad-cam)
+  Downloading ttach-0.0.3-py3-none-any.whl.metadata (5.2 kB)
+Collecting tqdm (from grad-cam)
+  Downloading tqdm-4.70.0-py3-none-any.whl.metadata (57 kB)
+Collecting opencv-python (from grad-cam)
+  Downloading opencv_python-5.0.0.93-cp37-abi3-win_amd64.whl.metadata (20 kB)
+Collecting matplotlib (from grad-cam)
+  Downloading matplotlib-3.11.1-cp312-cp312-win_amd64.whl.metadata (80 kB)
+Collecting scikit-learn (from grad-cam)
+  Downloading scikit_learn-1.9.0-cp312-cp312-win_amd64.whl.metadata (11 kB)
+Collecting filelock (from torch>=1.7.1->grad-cam)
+  Downloading filelock-3.32.3-py3-none-any.whl.metadata (2.0 kB)
+Collecting typing-extensions>=4.10.0 (from torch>=1.7.1->grad-cam)
+  Downloading typing_extensions-4.16.0-py3-none-any.whl.metadata (3.3 kB)
+Collecting setuptools>=77.0.3 (from torch>=1.7.1->grad-cam)
+  Downloading setuptools-84.0.0-py3-none-any.whl.metadata (6.6 kB)
+Collecting sympy>=1.13.3 (from torch>=1.7.1->grad-cam)
+  Downloading sympy-1.14.0-py3-none-any.whl.metadata (12 kB)
+Collecting networkx>=2.5.1 (from torch>=1.7.1->grad-cam)
+  Downloading networkx-3.6.1-py3-none-any.whl.metadata (6.8 kB)
+Collecting jinja2 (from torch>=1.7.1->grad-cam)
+  Downloading jinja2-3.1.6-py3-none-any.whl.metadata (2.9 kB)
+Collecting fsspec>=0.8.5 (from torch>=1.7.1->grad-cam)
+  Downloading fsspec-2026.7.0-py3-none-any.whl.metadata (10 kB)
+Collecting contourpy>=1.0.1 (from matplotlib->grad-cam)
+  Downloading contourpy-1.3.3-cp312-cp312-win_amd64.whl.metadata (5.5 kB)
+Collecting cycler>=0.10 (from matplotlib->grad-cam)
+  Downloading cycler-0.12.1-py3-none-any.whl.metadata (3.8 kB)
+Collecting fonttools>=4.28.2 (from matplotlib->grad-cam)
+  Downloading fonttools-4.63.0-cp312-cp312-win_amd64.whl.metadata (121 kB)
+Collecting kiwisolver>=1.3.1 (from matplotlib->grad-cam)
+  Downloading kiwisolver-1.5.0-cp312-cp312-win_amd64.whl.metadata (5.2 kB)
