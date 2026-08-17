@@ -14,6 +14,7 @@ Local:
 """
 
 from __future__ import annotations
+from tqdm import tqdm
 import os
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
@@ -682,75 +683,27 @@ def eval_stage1(
 # HYBRID — DEEP + PHYSICS
 # ============================================================
 
-def train_epoch_hybrid(
-    model,
-    loader,
-    criterion,
-    optimizer,
-    device,
-) -> Dict[str, float]:
-
+def train_epoch_hybrid(model, loader, criterion, optimizer, device) -> Dict[str, float]:
     model.train()
-
     total_loss = 0.0
     correct = 0
     total = 0
-
-    for batch in loader:
-
-        images = batch["image"].to(
-            device,
-            non_blocking=True,
-        )
-
-        physics = batch["physics"].to(
-            device,
-            non_blocking=True,
-        )
-
-        labels = batch["label"].to(
-            device,
-            non_blocking=True,
-        )
-
-        optimizer.zero_grad(
-            set_to_none=True
-        )
-
-        logits, _ = model(
-            images,
-            physics,
-        )
-
-        loss = criterion(
-            logits,
-            labels,
-        )
-
+    pbar = tqdm(loader, desc="Training", leave=False)
+    for batch in pbar:
+        images = batch["image"].to(device)
+        physics = batch["physics"].to(device)
+        labels = batch["label"].to(device)
+        optimizer.zero_grad()
+        logits, _ = model(images, physics)
+        loss = criterion(logits, labels)
         loss.backward()
-
         optimizer.step()
-
-        total_loss += (
-            loss.item()
-            * images.size(0)
-        )
-
-        predictions = logits.argmax(
-            dim=1
-        )
-
-        correct += (
-            predictions == labels
-        ).sum().item()
-
+        total_loss += loss.item() * images.size(0)
+        preds = logits.argmax(dim=1)
+        correct += (preds == labels).sum().item()
         total += images.size(0)
-
-    return {
-        "loss": total_loss / total,
-        "acc": correct / total,
-    }
-
+        pbar.set_postfix(loss=loss.item(), acc=correct / total)
+    return {"loss": total_loss / total, "acc": correct / total}
 
 @torch.no_grad()
 def eval_hybrid(
