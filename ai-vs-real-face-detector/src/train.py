@@ -12,6 +12,8 @@ Local:
     Do NOT run training loops on an 8GB RAM laptop.
     Use inference.py with a downloaded checkpoint.
 """
+
+from __future__ import annotations
 import os
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
@@ -19,8 +21,6 @@ os.environ["MKL_NUM_THREADS"] = "1"
 import cv2
 cv2.setNumThreads(1)
 
-
-from __future__ import annotations
 import argparse
 import json
 import random
