@@ -1,25 +1,48 @@
-"""B1 — Face region and landmark detection via MediaPipe Face Mesh."""
+"""B1 — Face region and landmark detection via dlib (68-point).
+
+Replaces the MediaPipe-based detector to eliminate the TFLite/XNNPACK
+threading deadlock encountered during hybrid training. dlib has no
+TF/XNNPACK backend, so this class of deadlock isn't possible here.
+"""
 
 from __future__ import annotations
 
+import os
+import bz2
+import shutil
+import urllib.request
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
 
-# Lazy import mediapipe to avoid pulling tensorflow at module import time
-mp = None
+dlib = None  # lazy import, mirrors the old lazy mediapipe import
 
-# MediaPipe Face Mesh landmark indices (refine_landmarks=True enables iris points).
-LEFT_EYE_OUTER = 33
-LEFT_EYE_INNER = 133
-RIGHT_EYE_OUTER = 263
-RIGHT_EYE_INNER = 362
-LEFT_IRIS = list(range(468, 473))
-RIGHT_IRIS = list(range(473, 478))
-LEFT_EYE_CONTOUR = [33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246]
-RIGHT_EYE_CONTOUR = [362, 382, 381, 380, 374, 373, 390, 249, 263, 466, 388, 387, 386, 385, 384, 398]
+# dlib 68-point (ibug 300-W) landmark scheme.
+# Anatomical right eye (appears on the LEFT side of a front-facing image).
+DLIB_RIGHT_EYE = [36, 37, 38, 39, 40, 41]
+# Anatomical left eye (appears on the RIGHT side of a front-facing image).
+DLIB_LEFT_EYE = [42, 43, 44, 45, 46, 47]
+
+_MODEL_URL = "http://dlib.net/files/shape_predictor_68_face_landmarks.dat.bz2"
+_MODEL_DIR = os.path.expanduser("~/.cache/dlib_models")
+_MODEL_PATH = os.path.join(_MODEL_DIR, "shape_predictor_68_face_landmarks.dat")
+
+
+def _ensure_model() -> str:
+    """Download dlib's pretrained 68-point landmark model if not already cached."""
+    if os.path.exists(_MODEL_PATH):
+        return _MODEL_PATH
+    os.makedirs(_MODEL_DIR, exist_ok=True)
+    compressed_path = _MODEL_PATH + ".bz2"
+    print("Downloading dlib 68-point landmark model (one-time, ~95MB)...")
+    urllib.request.urlretrieve(_MODEL_URL, compressed_path)
+    with bz2.BZ2File(compressed_path) as f_in, open(_MODEL_PATH, "wb") as f_out:
+        shutil.copyfileobj(f_in, f_out)
+    os.remove(compressed_path)
+    print("Model ready at", _MODEL_PATH)
+    return _MODEL_PATH
 
 
 @dataclass
@@ -27,8 +50,8 @@ class EyeRegion:
     side: str  # "left" or "right"
     bbox: Tuple[int, int, int, int]  # x, y, w, h
     center: Tuple[float, float]
-    contour_points: np.ndarray  # (N, 2) pixel coords
-    iris_points: np.ndarray  # (5, 2) pixel coords
+    contour_points: np.ndarray  # (6, 2) pixel coords
+    iris_points: np.ndarray  # (5, 2) pixel coords -- approximated, see class docstring
     crop: np.ndarray  # RGB crop of eye region
 
 
@@ -36,54 +59,60 @@ class EyeRegion:
 class FaceLandmarks:
     detected: bool
     image_shape: Tuple[int, int]
-    landmarks_normalized: Optional[np.ndarray] = None  # (478, 2) in [0,1]
-    landmarks_pixel: Optional[np.ndarray] = None  # (478, 2)
+    landmarks_normalized: Optional[np.ndarray] = None  # (68, 2) in [0,1]
+    landmarks_pixel: Optional[np.ndarray] = None  # (68, 2)
     left_eye: Optional[EyeRegion] = None
     right_eye: Optional[EyeRegion] = None
     debug: Dict = field(default_factory=dict)
 
 
 class FaceRegionDetector:
-    """Detect face mesh landmarks and extract per-eye regions."""
+    """Detect facial landmarks (dlib 68-point) and extract per-eye regions.
+
+    Drop-in replacement for the old MediaPipe detector: same public
+    interface (detect(), close(), context manager) and same EyeRegion /
+    FaceLandmarks shapes.
+
+    IMPORTANT DIFFERENCE FROM THE MEDIAPIPE VERSION:
+    dlib's 68-point model gives eye *contour* points only -- it has no
+    iris/pupil landmarks the way MediaPipe's refine_landmarks=True did.
+    iris_points here are therefore APPROXIMATED as a small 5-point ring
+    (center + 4 cardinal points) around the eye contour's centroid,
+    sized relative to eye width (iris_radius_ratio). This feeds into
+    iris_pupil.py's existing intensity-based pupil-boundary search the
+    same way MediaPipe's iris points did -- it's a reasonable proxy,
+    not true iris localization. If pupil/iris features look degraded
+    in debug_physics.py output compared to your earlier MediaPipe runs,
+    this approximation (and iris_radius_ratio) is the first thing to
+    tune.
+    """
 
     def __init__(
         self,
-        static_image_mode: bool = True,
         max_num_faces: int = 1,
-        refine_landmarks: bool = True,
-        min_detection_confidence: float = 0.5,
         eye_padding_ratio: float = 0.35,
+        iris_radius_ratio: float = 0.22,
     ) -> None:
-        global mp
-        if mp is None:
-            import mediapipe as _mp
+        global dlib
+        if dlib is None:
+            import dlib as _dlib
 
-            mp = _mp
+            dlib = _dlib
+
         self.eye_padding_ratio = eye_padding_ratio
-        self._mp_face_mesh = mp.solutions.face_mesh
-        self._face_mesh = self._mp_face_mesh.FaceMesh(
-            static_image_mode=static_image_mode,
-            max_num_faces=max_num_faces,
-            refine_landmarks=refine_landmarks,
-            min_detection_confidence=min_detection_confidence,
-        )
+        self.iris_radius_ratio = iris_radius_ratio
+        self.max_num_faces = max_num_faces
+
+        model_path = _ensure_model()
+        self._face_detector = dlib.get_frontal_face_detector()
+        self._shape_predictor = dlib.shape_predictor(model_path)
 
     def _to_rgb(self, image: np.ndarray) -> np.ndarray:
         if image.ndim == 2:
             return cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
         if image.shape[2] == 4:
             return cv2.cvtColor(image, cv2.COLOR_RGBA2RGB)
-        # Assume BGR from cv2.imread
         return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-
-    def _landmarks_to_pixel(
-        self, landmarks, width: int, height: int
-    ) -> np.ndarray:
-        points = np.array(
-            [(lm.x * width, lm.y * height) for lm in landmarks.landmark],
-            dtype=np.float32,
-        )
-        return points
 
     def _bbox_from_points(
         self, points: np.ndarray, width: int, height: int
@@ -98,21 +127,29 @@ class FaceRegionDetector:
         y_max = min(height, int(ys.max() + pad_y))
         return x_min, y_min, x_max - x_min, y_max - y_min
 
-    def _extract_eye(
-        self,
-        rgb: np.ndarray,
-        side: str,
-        contour_indices: List[int],
-        iris_indices: List[int],
-        all_points: np.ndarray,
-    ) -> EyeRegion:
+    def _approximate_iris_points(self, contour: np.ndarray) -> np.ndarray:
+        cx = float(contour[:, 0].mean())
+        cy = float(contour[:, 1].mean())
+        eye_width = float(contour[:, 0].max() - contour[:, 0].min())
+        r = max(1.0, eye_width * self.iris_radius_ratio)
+        return np.array(
+            [
+                [cx, cy],
+                [cx + r, cy],
+                [cx - r, cy],
+                [cx, cy + r],
+                [cx, cy - r],
+            ],
+            dtype=np.float32,
+        )
+
+    def _extract_eye(self, rgb: np.ndarray, side: str, contour: np.ndarray) -> EyeRegion:
         h, w = rgb.shape[:2]
-        contour = all_points[contour_indices]
-        iris = all_points[iris_indices]
         bbox = self._bbox_from_points(contour, w, h)
         x, y, bw, bh = bbox
         crop = rgb[y : y + bh, x : x + bw].copy()
         center = (float(contour[:, 0].mean()), float(contour[:, 1].mean()))
+        iris = self._approximate_iris_points(contour)
         return EyeRegion(
             side=side,
             bbox=bbox,
@@ -125,23 +162,25 @@ class FaceRegionDetector:
     def detect(self, image: np.ndarray) -> FaceLandmarks:
         rgb = self._to_rgb(image)
         h, w = rgb.shape[:2]
-        results = self._face_mesh.process(rgb)
+        gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
 
-        if not results.multi_face_landmarks:
+        faces = self._face_detector(gray, 1)
+        if len(faces) == 0:
             return FaceLandmarks(detected=False, image_shape=(h, w))
 
-        face = results.multi_face_landmarks[0]
-        pixel_points = self._landmarks_to_pixel(face, w, h)
+        face_rect = faces[0]
+        shape = self._shape_predictor(gray, face_rect)
+        pixel_points = np.array([(p.x, p.y) for p in shape.parts()], dtype=np.float32)  # (68, 2)
+
         normalized = pixel_points.copy()
         normalized[:, 0] /= w
         normalized[:, 1] /= h
 
-        left_eye = self._extract_eye(
-            rgb, "left", LEFT_EYE_CONTOUR, LEFT_IRIS, pixel_points
-        )
-        right_eye = self._extract_eye(
-            rgb, "right", RIGHT_EYE_CONTOUR, RIGHT_IRIS, pixel_points
-        )
+        right_contour = pixel_points[DLIB_RIGHT_EYE]
+        left_contour = pixel_points[DLIB_LEFT_EYE]
+
+        left_eye = self._extract_eye(rgb, "left", left_contour)
+        right_eye = self._extract_eye(rgb, "right", right_contour)
 
         return FaceLandmarks(
             detected=True,
@@ -153,7 +192,9 @@ class FaceRegionDetector:
         )
 
     def close(self) -> None:
-        self._face_mesh.close()
+        # dlib holds no persistent graph/session; kept for interface
+        # compatibility with callers using the close()/context-manager pattern.
+        pass
 
     def __enter__(self) -> "FaceRegionDetector":
         return self
@@ -163,15 +204,11 @@ class FaceRegionDetector:
 
 
 def draw_landmarks_debug(image: np.ndarray, landmarks: FaceLandmarks) -> np.ndarray:
-    """Visualize eye contours and iris points for debugging."""
+    """Visualize eye contours and approximated iris points for debugging."""
     if not landmarks.detected:
         return image.copy()
 
     vis = image.copy()
-    if vis.shape[2] == 3 and vis.dtype == np.uint8:
-        # Keep as-is; caller may pass BGR or RGB.
-        pass
-
     for eye in (landmarks.left_eye, landmarks.right_eye):
         if eye is None:
             continue
