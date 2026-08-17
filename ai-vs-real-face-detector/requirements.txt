@@ -1,2 +1,0 @@
-# Full dependencies including Colab/Kaggle training
--r requirements-local.txt

@@ -95,7 +95,9 @@ def predict(
             explainer = GradCAMExplainer(model, use_cuda=device_t.type == "cuda")
             result["heatmap"] = explainer.generate_base64_png(tensor, target_class=class_idx)
         except Exception as exc:
-            result["heatmap_error"] = str(exc)
+            import traceback
+            result["heatmap_error"] = f"{type(exc).__name__}: {exc}" if str(exc) else f"{type(exc).__name__} (no message)"
+            result["heatmap_traceback"] = traceback.format_exc()
 
     return result
 
