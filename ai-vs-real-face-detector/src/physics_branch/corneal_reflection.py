@@ -7,7 +7,6 @@ from typing import Optional, Tuple
 
 import cv2
 import numpy as np
-from skimage.transform import hough_circle, hough_circle_peaks
 
 from .region_detection import EyeRegion, FaceLandmarks
 
@@ -46,8 +45,9 @@ def detect_specular_highlight(
     intensity_percentile: float = 97.0,
 ) -> HighlightDetection:
     """
-    Detect bright corneal specular highlight using Canny edges + Hough circles
-    constrained by high-intensity regions.
+    Detect bright corneal specular highlight using cv2.HoughCircles
+    (replaces skimage's hough_circle_peaks, whose internal regionprops
+    call hangs/errors on certain accumulator shapes -- see project notes).
     """
     gray = _to_grayscale(eye_crop)
     h, w = gray.shape
@@ -57,33 +57,27 @@ def detect_specular_highlight(
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
     edges = cv2.Canny(blurred, canny_low, canny_high)
 
-    threshold = np.percentile(blurred, intensity_percentile)
-    bright_mask = (blurred >= threshold).astype(np.uint8) * 255
-    combined = cv2.bitwise_or(edges, bright_mask)
-
     min_r = max(2, int(min(h, w) * min_radius_ratio))
     max_r = max(min_r + 1, int(min(h, w) * max_radius_ratio))
-    radii = np.arange(min_r, max_r, 1)
 
-    if len(radii) == 0:
-        return HighlightDetection(detected=False, edges=edges)
-
-    hough = hough_circle(combined, radii)
-    accums, cx, cy, r = hough_circle_peaks(
-        hough,
-        radii,
-        total_num_peaks=1,
-        min_xdistance=min_r,
-        min_ydistance=min_r,
+    circles = cv2.HoughCircles(
+        blurred,
+        cv2.HOUGH_GRADIENT,
+        dp=1.2,
+        minDist=max(min_r, 4),
+        param1=canny_high,
+        param2=15,
+        minRadius=min_r,
+        maxRadius=max_r,
     )
 
-    if len(cx) == 0:
-        # Fallback: brightest connected component centroid
+    if circles is not None and len(circles[0]) > 0:
+        cx_f, cy_f, r_f = (float(v) for v in circles[0][0])
+    else:
+        # Fallback: brightest point, same as before
         _, _, _, max_loc = cv2.minMaxLoc(blurred)
         cx_f, cy_f = float(max_loc[0]), float(max_loc[1])
         r_f = float(min_r)
-    else:
-        cx_f, cy_f, r_f = float(cx[0]), float(cy[0]), float(r[0])
 
     mask = np.zeros_like(gray, dtype=np.uint8)
     cv2.circle(mask, (int(cx_f), int(cy_f)), max(1, int(r_f)), 255, -1)
@@ -107,7 +101,6 @@ def _normalize_highlight_mask(
     mask = detection.mask
     x, y, w, h = eye.bbox
     canvas = np.zeros(eye.contour_points.max(axis=0).astype(int)[::-1] * 0 + 1, dtype=np.uint8)
-    # Place mask in full-image coordinates
     full_h = int(eye.contour_points[:, 1].max()) + h
     full_w = int(eye.contour_points[:, 0].max()) + w
     full_h = max(full_h, y + mask.shape[0])
@@ -131,10 +124,6 @@ def analyze_corneal_reflections(
     iou_threshold: float = 0.35,
     target_size: Tuple[int, int] = (64, 64),
 ) -> CornealReflectionResult:
-    """
-    Compare specular highlights between left and right eyes.
-    Real faces under a single light source tend to show symmetric highlights.
-    """
     empty = HighlightDetection(detected=False)
     if not landmarks.detected or landmarks.left_eye is None or landmarks.right_eye is None:
         return CornealReflectionResult(
@@ -149,18 +138,13 @@ def analyze_corneal_reflections(
     left_det = detect_specular_highlight(landmarks.left_eye.crop)
     right_det = detect_specular_highlight(landmarks.right_eye.crop)
 
-    left_mask = _align_eye_highlight_to_canonical(
-        left_det, landmarks.left_eye, target_size
-    )
-    right_mask = _align_eye_highlight_to_canonical(
-        right_det, landmarks.right_eye, target_size
-    )
+    left_mask = _align_eye_highlight_to_canonical(left_det, landmarks.left_eye, target_size)
+    right_mask = _align_eye_highlight_to_canonical(right_det, landmarks.right_eye, target_size)
 
     if left_mask is None or right_mask is None:
         iou = 0.0
         offset = (0.0, 0.0)
     else:
-        # Flip right mask horizontally to compare symmetry
         right_flipped = np.fliplr(right_mask)
         iou = compute_highlight_iou(left_mask, right_flipped)
         offset = _highlight_offset(left_det, right_det)
@@ -199,5 +183,4 @@ def _highlight_offset(
     assert left.center is not None and right.center is not None
     lx, ly = left.center
     rx, ry = right.center
-    # Mirror right x to compare relative positions
     return (float(lx - rx), float(ly - ry))
