@@ -13,17 +13,24 @@ from src.physics_branch.feature_vector import PhysicsFeatureExtractor
 from src.physics_branch.normalization import PhysicsNormalizer
 from src.prnu_branch.extractor import PRNUExtractor, PRNU_FEATURE_NAMES
 
+
+def _load_rgb(path: str) -> np.ndarray:
+    bgr = cv2.imread(path)
+    if bgr is None:
+        raise FileNotFoundError(f"Could not read image: {path}")
+    return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+
+
 def fit_physics_and_prnu_scalers(
     sample_paths: Sequence[str],
     max_samples: int = 300,
     seed: int = 42,
 ) -> Tuple[PhysicsNormalizer, PhysicsNormalizer]:
     """
-    Fit z-score scalers for physics and PRNU vectors on a subsample of
-    training paths (not the full training set -- fitting scalers on
-    every image is unnecessary and expensive; a representative sample
-    of max_samples is sufficient for stable mean/std estimates).
-    Raises if any feature extraction fails.
+    Fit z-score scalers for physics and PRNU vectors on a representative
+    subsample of training paths (not the full training set -- fitting on
+    every image is unnecessary for stable mean/std estimates and, at full
+    dataset size, prohibitively slow). Raises if any feature extraction fails.
     """
     paths = list(sample_paths)
     if len(paths) > max_samples:
