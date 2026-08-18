@@ -36,6 +36,7 @@ torch.set_num_threads(1)
 import torch.nn as nn
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
+from sklearn.metrics import accuracy_score, confusion_matrix, precision_recall_fscore_support, roc_auc_score
 
 
 # ============================================================
@@ -57,7 +58,7 @@ if str(PROJECT_ROOT) not in sys.path:
 # PROJECT IMPORTS
 # ============================================================
 
-from src.classifier.head import HybridClassifier
+from src.classifier.head import FullHybridClassifier, HybridClassifier
 from src.deep_branch.feature_extractor import DeepClassifier
 from src.deep_branch.preprocessing import (
     FacePreprocessor,
@@ -68,6 +69,10 @@ from src.physics_branch.feature_vector import (
     PhysicsFeatureExtractor,
     PHYSICS_FEATURE_DIM,
 )
+from src.physics_branch.normalization import PhysicsNormalizer
+from src.prnu_branch.extractor import PRNUExtractor
+from src.semantic_branch.encoder import DEFAULT_VIT_MODEL, SemanticEncoder
+from src.fusion.fuse import FusionMode
 
 
 # ============================================================
@@ -168,17 +173,25 @@ class FaceBinaryDataset(Dataset):
         val_ratio: float = 0.15,
         seed: int = 42,
         use_physics: bool = False,
+        use_prnu: bool = False,
+        use_semantic: bool = False,
+        semantic_model: str = DEFAULT_VIT_MODEL,
+        semantic_pretrained: bool = True,
         preprocessor: Optional[FacePreprocessor] = None,
         transform=None,
     ) -> None:
 
-        if split not in {"train", "val"}:
+        if split not in {"train", "val", "test"}:
             raise ValueError(
-                f"Invalid split '{split}'. Expected 'train' or 'val'."
+                f"Invalid split '{split}'. Expected 'train', 'val', or 'test'."
             )
 
         self.root = Path(root)
         self.use_physics = use_physics
+        self.use_prnu = use_prnu
+        self.use_semantic = use_semantic
+        self.semantic_model = semantic_model
+        self.semantic_pretrained = semantic_pretrained
 
         self.preprocessor = (
             preprocessor
@@ -187,13 +200,27 @@ class FaceBinaryDataset(Dataset):
         )
 
         self.transform = transform
+        self.explicit_split_layout = all(
+            (self.root / split_name / class_name).is_dir()
+            for split_name in ("train", "val", "test")
+            for class_name in ("real", "fake")
+        )
+        if split == "test" and not self.explicit_split_layout:
+            raise FileNotFoundError(
+                "Held-out testing requires data/{train,val,test}/{real,fake}. "
+                "A legacy data/{real,fake} layout has no safe test split."
+            )
 
-        # Physics extractor is only created for hybrid training.
+        # These extractors return real forensic/semantic measurements.  A
+        # failure is deliberately propagated: full_hybrid must never train on
+        # fabricated placeholder modalities.
         self.physics_extractor = (
             PhysicsFeatureExtractor()
             if use_physics
             else None
         )
+        self.prnu_extractor = PRNUExtractor() if self.use_prnu else None
+        self.semantic_extractor = None
 
         # ----------------------------------------------------
         # Find all images recursively
@@ -214,7 +241,11 @@ class FaceBinaryDataset(Dataset):
             (1, "fake"),
         ):
 
-            folder = self.root / subdir
+            folder = (
+                self.root / split / subdir
+                if self.explicit_split_layout
+                else self.root / subdir
+            )
 
             if not folder.exists():
                 print(
@@ -299,7 +330,14 @@ class FaceBinaryDataset(Dataset):
         print(f"  TOTAL: {len(samples)}")
 
         # ----------------------------------------------------
-        # Stratified train/validation split
+        # Explicit held-out layout (preferred)
+        # ----------------------------------------------------
+        if self.explicit_split_layout:
+            self.samples = samples
+        else:
+            # ----------------------------------------------------
+            # Legacy stratified train/validation split.  Kept for existing
+            # stage1/hybrid commands; it is never used for held-out testing.
         # ----------------------------------------------------
         #
         # We split separately for:
@@ -312,67 +350,67 @@ class FaceBinaryDataset(Dataset):
         # disappearing from validation.
         # ----------------------------------------------------
 
-        groups: Dict[
+            groups: Dict[
             Tuple[int, str],
             List[Tuple[str, int, str]]
         ] = defaultdict(list)
 
-        for sample in samples:
+            for sample in samples:
 
-            _, label, source = sample
+                _, label, source = sample
 
-            groups[(label, source)].append(sample)
+                groups[(label, source)].append(sample)
 
-        train_samples: List[
+            train_samples: List[
             Tuple[str, int, str]
         ] = []
 
-        val_samples: List[
+            val_samples: List[
             Tuple[str, int, str]
         ] = []
 
-        rng = random.Random(seed)
+            rng = random.Random(seed)
 
-        for (label, source), group in sorted(groups.items()):
+            for (label, source), group in sorted(groups.items()):
 
-            group = group.copy()
+                group = group.copy()
 
-            rng.shuffle(group)
+                rng.shuffle(group)
 
             # Calculate train split.
-            split_idx = int(
-                len(group) * (1.0 - val_ratio)
-            )
+                split_idx = int(
+                    len(group) * (1.0 - val_ratio)
+                )
 
             # Guarantee at least one validation sample
             # when the group contains at least two images.
-            if len(group) > 1:
+                if len(group) > 1:
 
-                split_idx = min(
-                    max(split_idx, 1),
-                    len(group) - 1,
+                    split_idx = min(
+                        max(split_idx, 1),
+                        len(group) - 1,
+                    )
+
+                else:
+
+                    split_idx = len(group)
+
+                train_samples.extend(
+                    group[:split_idx]
                 )
 
-            else:
-
-                split_idx = len(group)
-
-            train_samples.extend(
-                group[:split_idx]
-            )
-
-            val_samples.extend(
-                group[split_idx:]
-            )
+                val_samples.extend(
+                    group[split_idx:]
+                )
 
         # Shuffle final datasets.
-        rng.shuffle(train_samples)
-        rng.shuffle(val_samples)
+            rng.shuffle(train_samples)
+            rng.shuffle(val_samples)
 
-        if split == "train":
-            self.samples = train_samples
-        else:
-            self.samples = val_samples
+            if split == "train":
+                self.samples = train_samples
+            else:
+                self.samples = val_samples
 
         # ----------------------------------------------------
         # Print split composition
@@ -463,6 +501,28 @@ class FaceBinaryDataset(Dataset):
                 dtype=np.float32,
             )
 
+        if self.use_prnu:
+            if self.prnu_extractor is None:
+                raise RuntimeError("PRNU extractor is unavailable for full_hybrid.")
+            prnu_vec = self.prnu_extractor.extract(rgb).vector
+        else:
+            prnu_vec = None
+
+        if self.use_semantic:
+            # Lazy construction avoids loading a ViT in stage1/hybrid modes
+            # and ensures each DataLoader worker owns its encoder safely.
+            if self.semantic_extractor is None:
+                self.semantic_extractor = SemanticEncoder(
+                    model_name=self.semantic_model,
+                    pretrained=self.semantic_pretrained,
+                    device=torch.device("cpu"),
+                )
+            semantic_vec = self.semantic_extractor.extract(
+                rgb, return_attention=False
+            ).features
+        else:
+            semantic_vec = None
+
         # ----------------------------------------------------
         # Deep-learning preprocessing
         # ----------------------------------------------------
@@ -477,7 +537,7 @@ class FaceBinaryDataset(Dataset):
         # Return sample
         # ----------------------------------------------------
 
-        return {
+        sample = {
             "image": tensor,
 
             "label": torch.tensor(
@@ -496,15 +556,18 @@ class FaceBinaryDataset(Dataset):
 
             "source": source,
         }
+        if prnu_vec is not None:
+            sample["prnu"] = torch.from_numpy(np.asarray(prnu_vec, dtype=np.float32))
+        if semantic_vec is not None:
+            sample["semantic"] = torch.from_numpy(np.asarray(semantic_vec, dtype=np.float32))
+        return sample
 
 
 # ============================================================
 # DATA LOADERS
 # ============================================================
 
-def build_loaders(
-    args,
-) -> Tuple[DataLoader, DataLoader]:
+def build_loaders(args):
 
     preprocessor = FacePreprocessor()
 
@@ -517,7 +580,11 @@ def build_loaders(
         split="train",
         val_ratio=args.val_ratio,
         seed=args.seed,
-        use_physics=args.mode == "hybrid",
+        use_physics=args.mode in {"hybrid", "full_hybrid"},
+        use_prnu=args.mode == "full_hybrid",
+        use_semantic=args.mode == "full_hybrid",
+        semantic_model=args.semantic_model,
+        semantic_pretrained=not args.no_semantic_pretrained,
         preprocessor=preprocessor,
         transform=get_train_transforms(),
     )
@@ -531,7 +598,11 @@ def build_loaders(
         split="val",
         val_ratio=args.val_ratio,
         seed=args.seed,
-        use_physics=args.mode == "hybrid",
+        use_physics=args.mode in {"hybrid", "full_hybrid"},
+        use_prnu=args.mode == "full_hybrid",
+        use_semantic=args.mode == "full_hybrid",
+        semantic_model=args.semantic_model,
+        semantic_pretrained=not args.no_semantic_pretrained,
         preprocessor=preprocessor,
         transform=get_val_transforms(),
     )
@@ -556,7 +627,21 @@ def build_loaders(
         pin_memory=True,
     )
 
-    return train_loader, val_loader
+    if args.mode != "full_hybrid":
+        return train_loader, val_loader
+
+    test_ds = FaceBinaryDataset(
+        root=args.data_dir, split="test", seed=args.seed,
+        use_physics=True, use_prnu=True, use_semantic=True,
+        semantic_model=args.semantic_model, preprocessor=preprocessor,
+        semantic_pretrained=not args.no_semantic_pretrained,
+        transform=get_val_transforms(),
+    )
+    test_loader = DataLoader(
+        test_ds, batch_size=args.batch_size, shuffle=False,
+        num_workers=args.num_workers, pin_memory=True,
+    )
+    return train_loader, val_loader, test_loader
 
 
 # ============================================================
@@ -768,6 +853,66 @@ def eval_hybrid(
 
 
 # ============================================================
+# FULL HYBRID — DEEP + PHYSICS + PRNU + SEMANTIC
+# ============================================================
+
+def _full_hybrid_epoch(model, loader, criterion, device, optimizer=None) -> Dict[str, float]:
+    training = optimizer is not None
+    model.train(training)
+    total_loss = 0.0
+    labels_all, preds_all, scores_all = [], [], []
+    context = torch.enable_grad() if training else torch.no_grad()
+    with context:
+        for batch in loader:
+            try:
+                images = batch["image"].to(device, non_blocking=True)
+                physics = batch["physics"].to(device, non_blocking=True)
+                prnu = batch["prnu"].to(device, non_blocking=True)
+                semantic = batch["semantic"].to(device, non_blocking=True)
+                labels = batch["label"].to(device, non_blocking=True)
+            except KeyError as exc:
+                raise RuntimeError(
+                    "full_hybrid requires image, physics, PRNU, and semantic features; "
+                    f"missing {exc.args[0]!r}."
+                ) from exc
+            if training:
+                optimizer.zero_grad(set_to_none=True)
+            logits, _ = model(images, physics, prnu, semantic)
+            loss = criterion(logits, labels)
+            if training:
+                loss.backward()
+                optimizer.step()
+            total_loss += loss.item() * images.size(0)
+            labels_all.extend(labels.detach().cpu().tolist())
+            preds_all.extend(logits.argmax(dim=1).detach().cpu().tolist())
+            scores_all.extend(torch.softmax(logits, dim=1)[:, 1].detach().cpu().tolist())
+    if not labels_all:
+        raise RuntimeError("No samples were available for full_hybrid evaluation.")
+    precision, recall, f1, _ = precision_recall_fscore_support(
+        labels_all, preds_all, average="binary", zero_division=0
+    )
+    metrics = {
+        "loss": total_loss / len(labels_all),
+        "acc": float(accuracy_score(labels_all, preds_all)),
+        "precision": float(precision), "recall": float(recall), "f1": float(f1),
+        "confusion_matrix": confusion_matrix(labels_all, preds_all, labels=[0, 1]).tolist(),
+    }
+    # ROC-AUC is undefined for a one-class split; report it explicitly instead
+    # of silently inventing a score.
+    metrics["roc_auc"] = float(roc_auc_score(labels_all, scores_all)) if len(set(labels_all)) == 2 else None
+    return metrics
+
+
+def train_epoch_full_hybrid(model, loader, criterion, optimizer, device) -> Dict[str, float]:
+    return _full_hybrid_epoch(model, loader, criterion, device, optimizer)
+
+
+@torch.no_grad()
+def eval_full_hybrid(model, loader, criterion, device) -> Dict[str, float]:
+    return _full_hybrid_epoch(model, loader, criterion, device)
+
+
+# ============================================================
 # CHECKPOINT
 # ============================================================
 
@@ -779,6 +924,8 @@ def save_checkpoint(
     metrics: dict,
     mode: str,
     args,
+    physics_normalizer: Optional[PhysicsNormalizer] = None,
+    prnu_normalizer: Optional[PhysicsNormalizer] = None,
 ) -> None:
 
     path.parent.mkdir(
@@ -786,8 +933,7 @@ def save_checkpoint(
         exist_ok=True,
     )
 
-    torch.save(
-        {
+    payload = {
             "epoch": epoch,
 
             "model_state_dict":
@@ -805,11 +951,13 @@ def save_checkpoint(
             "args":
                 vars(args),
 
-            "physics_dim":
-                PHYSICS_FEATURE_DIM,
-        },
-        path,
-    )
+            "physics_dim": PHYSICS_FEATURE_DIM,
+    }
+    if physics_normalizer is not None:
+        payload["physics_normalizer"] = physics_normalizer.to_dict()
+    if prnu_normalizer is not None:
+        payload["prnu_normalizer"] = prnu_normalizer.to_dict()
+    torch.save(payload, path)
 
     print(
         f"Saved checkpoint: {path}"
@@ -1228,6 +1376,67 @@ def run_hybrid(
     )
 
 
+def run_full_hybrid(args, device) -> None:
+    """Train the four-modality model using only explicit train/val/test sets."""
+    print("\n" + "=" * 60)
+    print("FULL HYBRID TRAINING — EFFICIENTNET + PHYSICS + PRNU + ViT")
+    print("=" * 60)
+    train_loader, val_loader, test_loader = build_loaders(args)
+
+    # Fit scaling statistics solely on paths in the training split.  The
+    # normalizers are serialized into the checkpoint for identical inference.
+    from src.features.feature_scalers import fit_physics_and_prnu_scalers
+    train_paths = [path for path, _, _ in train_loader.dataset.samples]
+    physics_normalizer, prnu_normalizer = fit_physics_and_prnu_scalers(train_paths)
+
+    model = FullHybridClassifier(
+        model_name=args.backbone, semantic_model=args.semantic_model,
+        semantic_pretrained=not args.no_semantic_pretrained,
+        semantic_dim=args.semantic_dim, pretrained=not args.no_pretrained,
+        freeze_blocks=args.freeze_blocks, fusion_mode=FusionMode(args.fusion_mode),
+        normalize_physics=True, normalize_prnu=True,
+    ).to(device)
+    model.set_feature_scalers(physics_normalizer, prnu_normalizer)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.AdamW(
+        filter(lambda p: p.requires_grad, model.parameters()),
+        lr=args.lr, weight_decay=args.weight_decay,
+    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+    best_acc, history = -1.0, []
+    for epoch in range(1, args.epochs + 1):
+        train_metrics = train_epoch_full_hybrid(model, train_loader, criterion, optimizer, device)
+        val_metrics = eval_full_hybrid(model, val_loader, criterion, device)
+        scheduler.step()
+        record = {"epoch": epoch, "train": train_metrics, "val": val_metrics}
+        history.append(record)
+        print(
+            f"[FullHybrid Epoch {epoch}/{args.epochs}] train loss={train_metrics['loss']:.4f} "
+            f"acc={train_metrics['acc']:.4f} | val loss={val_metrics['loss']:.4f} "
+            f"acc={val_metrics['acc']:.4f} f1={val_metrics['f1']:.4f}"
+        )
+        if val_metrics["acc"] > best_acc:
+            best_acc = val_metrics["acc"]
+            save_checkpoint(
+                Path(args.output_dir) / "full_hybrid_best.pt", model, optimizer, epoch,
+                val_metrics, "full_hybrid", args, physics_normalizer, prnu_normalizer,
+            )
+
+    # Test only after model selection; test samples are never folded into
+    # optimization or validation.
+    checkpoint_path = Path(args.output_dir) / "full_hybrid_best.pt"
+    if not checkpoint_path.exists():
+        raise RuntimeError("No full_hybrid checkpoint was saved; validation produced no epoch.")
+    best_checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    model.load_state_dict(best_checkpoint["model_state_dict"])
+    test_metrics = eval_full_hybrid(model, test_loader, criterion, device)
+    history_payload = {"epochs": history, "test": test_metrics}
+    with open(Path(args.output_dir) / "full_hybrid_history.json", "w") as f:
+        json.dump(history_payload, f, indent=2)
+    print("Held-out test metrics:", json.dumps(test_metrics, indent=2))
+    print("Checkpoint:", checkpoint_path)
+
+
 # ============================================================
 # ARGUMENTS
 # ============================================================
@@ -1246,11 +1455,13 @@ def parse_args():
         choices=[
             "stage1",
             "hybrid",
+            "full_hybrid",
         ],
         default="stage1",
         help=(
             "stage1 = deep branch only; "
-            "hybrid = deep + physics"
+            "hybrid = deep + physics; "
+            "full_hybrid = deep + physics + PRNU + ViT"
         ),
     )
 
@@ -1259,8 +1470,8 @@ def parse_args():
         type=str,
         default="data",
         help=(
-            "Root directory containing "
-            "real/ and fake/"
+            "For full_hybrid: data/{train,val,test}/{real,fake}. "
+            "Legacy stage1/hybrid also accept data/{real,fake}."
         ),
     )
 
@@ -1283,6 +1494,38 @@ def parse_args():
         type=int,
         default=5,
         help="Number of early backbone blocks to freeze.",
+    )
+
+    parser.add_argument(
+        "--semantic-model",
+        type=str,
+        default=DEFAULT_VIT_MODEL,
+        help="Frozen timm ViT/CLIP-compatible semantic backbone for full_hybrid.",
+    )
+
+    parser.add_argument(
+        "--semantic-dim",
+        type=int,
+        default=384,
+        help="Embedding dimension emitted by --semantic-model (384 for vit_small_patch16_224).",
+    )
+
+    parser.add_argument(
+        "--fusion-mode",
+        choices=[mode.value for mode in FusionMode],
+        default=FusionMode.GATED.value,
+        help="Four-modality fusion method for full_hybrid.",
+    )
+
+    parser.add_argument(
+        "--no-pretrained",
+        action="store_true",
+        help="Do not download/use pretrained EfficientNet weights (smoke tests only).",
+    )
+    parser.add_argument(
+        "--no-semantic-pretrained",
+        action="store_true",
+        help="Do not download/use pretrained semantic weights (smoke tests only).",
     )
 
     parser.add_argument(
@@ -1425,6 +1668,10 @@ def main() -> None:
             args,
             device,
         )
+
+    elif args.mode == "full_hybrid":
+
+        run_full_hybrid(args, device)
 
 
 # ============================================================

@@ -1,32 +1,39 @@
 # AI vs Real Face Detector
 
-Hybrid classifier that combines a **deep learning branch** (EfficientNet-B0 via `timm`) with a **physics-based forensic branch** (corneal specular highlights, iris/pupil analysis, light-direction consistency) to detect AI-generated vs real face portraits.
+Hybrid classifier combining **EfficientNet-B0**, **physics-based forensics** (dlib landmarks, Fresnel corneal analysis, iris/pupil, shadow geometry), optional **PRNU camera forensics**, and **ViT semantic features** with configurable fusion (concat / gated / attention).
 
 ## Architecture
 
 ```
 Input Image
-    ├── Deep Branch (EfficientNet-B0) ──► embedding vector
-    └── Physics Branch (MediaPipe + CV) ──► handcrafted vector
-                    │
-            Concatenate (fusion)
-                    │
-              MLP classifier
-                    │
-         label + confidence + Grad-CAM
+    ├── Preprocessing (face detect, align, crop, 224×224, ImageNet norm)
+    ├── Deep Branch (EfficientNet-B0) ──► 1280-d embedding
+    ├── Physics Branch (dlib + CV) ──► 20-d features (+ Fresnel/shadow metadata)
+    ├── PRNU Branch (noise residual) ──► 9-d features [explainability; limited without reference]
+    └── Semantic Branch (ViT-S/16) ──► 384-d embedding + attention map
+                │
+        Fusion (concat | gated | attention)
+                │
+          MLP classifier + calibration
+                │
+    REAL / AI_GENERATED / UNCERTAIN + explainability bundle
 ```
 
-## Hardware note
+## Implemented vs experimental
 
-**Do not train on an 8GB RAM laptop without GPU.** Training scripts are written for **Google Colab / Kaggle GPU runtimes**. Locally you can run:
-
-- Physics branch analysis and unit tests
-- Single-image inference with a downloaded checkpoint
-- API / DB / Docker infrastructure
-
-## Project structure
-
-See the repository layout under `src/`, `data/`, `models/`, `tests/`, `docker/`, and `notebooks/`.
+| Feature | Status |
+|---------|--------|
+| EfficientNet + Physics hybrid (concat) | **Implemented** — `hybrid_best.pt` checkpoint |
+| Face alignment before deep branch | **Implemented** — config `inference.align_face` |
+| Fresnel reflection analysis | **Implemented** — metadata + explainability |
+| Shadow/illumination geometry | **Implemented** |
+| PRNU noise forensics | **Implemented** — reliability `limited` without reference camera |
+| ViT semantic encoder | **Implemented** — explainability; classification requires `full_hybrid` training |
+| Gated / attention fusion | **Implemented** — requires `full_hybrid` checkpoint |
+| Patch localization heatmaps | **Implemented** |
+| Probability calibration + UNCERTAIN | **Implemented** |
+| Full ablation study | **Implemented** — `evaluate.py --ablation` |
+| Full hybrid trained checkpoint | **Experimental** — train with `--mode full_hybrid` on Colab |
 
 ## Quick start (local)
 
@@ -38,83 +45,41 @@ pip install -r requirements.txt
 pytest tests/ -v
 ```
 
-### Physics branch on one image (debug)
-
-```python
-import cv2
-from src.physics_branch.feature_vector import PhysicsFeatureExtractor
-
-img = cv2.imread("path/to/portrait.jpg")
-with PhysicsFeatureExtractor() as ext:
-    result = ext.extract(img)
-print(result.to_dict())
-```
-
-### Inference (requires trained checkpoint)
-
-Train on Colab first, download `models/hybrid_best.pt`, then:
+### Inference (requires `models/hybrid_best.pt`)
 
 ```bash
 python src/inference.py path/to/face.jpg --checkpoint models/hybrid_best.pt
 ```
 
-## Training (Colab / Kaggle only)
+Use `--no-align` for legacy full-frame resize (matches original training).
 
-Open `notebooks/train_colab.ipynb` or upload the project and run:
-
-```bash
-# Stage 1 — deep branch baseline
-python src/train.py --mode stage1 --data-dir data --epochs 10 --output-dir models
-
-# Stage 3 — hybrid fusion training (after stage1 checkpoint exists)
-python src/train.py --mode hybrid --data-dir data --epochs 15 --output-dir models
-```
-
-### Dataset layout
-
-```
-data/
-  real/    # FFHQ subset
-  fake/    # StyleGAN2/3 faces (add diffusion faces in pass 2)
-```
-
-**Pass 1:** FFHQ vs StyleGAN2  
-**Pass 2:** Add diffusion faces (e.g. Purdue AI-Face-FairnessBench or Kaggle deepfake set)
-
-## API & Docker (Stage 5)
+### Evaluation
 
 ```bash
-cd docker
-docker compose up --build
+python src/evaluate.py --checkpoint models/hybrid_best.pt --data-dir data
+python src/evaluate.py --ablation  # ablation comparison
 ```
 
-- API docs: http://localhost:8000/docs  
-- Dashboard: http://localhost:8000/dashboard/
+### API
 
-Place a trained checkpoint at `models/hybrid_best.pt` before starting the API.
-
-## Outputs
-
-Inference returns JSON:
-
-```json
-{
-  "label": "ai",
-  "confidence_score": 87.5,
-  "probability_distribution": { "real": 12.5, "ai": 87.5 },
-  "heatmap": "<base64 PNG>"
-}
+```bash
+uvicorn src.api.main:app --host 0.0.0.0 --port 8000
 ```
 
-## Configuration
+## Hardware note
 
-Edit `src/config/config.yaml` for thresholds, model paths, DB URL, and logging.
+Training requires **Google Colab / Kaggle GPU**. Local 8GB RAM is fine for single-image inference and tests.
 
-## References
+## Project structure
 
-- Hu, Li & Lyu (ICASSP 2021) — corneal specular highlight inconsistency in GAN faces  
-- Reference implementation: [discovershu/gan_detect_iris](https://github.com/discovershu/gan_detect_iris)
+- `src/deep_branch/` — preprocessing, face alignment, EfficientNet
+- `src/physics_branch/` — landmarks, Fresnel, iris/pupil, shadows
+- `src/prnu_branch/` — PRNU noise forensics
+- `src/semantic_branch/` — ViT encoder + attention maps
+- `src/fusion/` — concat, gated, attention fusion
+- `src/localization/` — patch-level scoring
+- `src/calibration/` — temperature scaling, uncertainty
+- `src/explain/` — Grad-CAM, human-readable explanations
+- `src/classifier/` — HybridClassifier, FullHybridClassifier, ablation configs
 
-## License
-
-MIT (add your license as needed)
+See `EVALUATION.md` and `PROJECT_DOCUMENTATION.md` for details.

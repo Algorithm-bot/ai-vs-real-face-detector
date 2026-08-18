@@ -10,6 +10,7 @@ services:
     volumes:
       - ../models:/app/models
       - ../logs:/app/logs
+      - ../dashboard:/app/dashboard
     depends_on:
       db:
         condition: service_healthy

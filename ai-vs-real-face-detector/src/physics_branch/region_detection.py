@@ -702,6 +702,7 @@ class FaceRegionDetector:
                 "detector": "dlib_68",
                 "iris_points": "approximated",
                 "detection_scale": scale,
+                "face_count": len(faces),
             },
         )
 

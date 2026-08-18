@@ -11,6 +11,8 @@ import torch
 from PIL import Image
 from torchvision import transforms
 
+from src.deep_branch.face_align import FaceAligner, FaceAlignResult, FaceDetectionStatus, _ensure_rgb as ensure_rgb_uint8
+
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
@@ -21,6 +23,10 @@ DEFAULT_IMAGE_SIZE = 224
 @dataclass
 class PreprocessConfig:
     image_size: int = DEFAULT_IMAGE_SIZE
+
+    # Face detection and alignment before resize/normalize.
+    align_face: bool = False
+    is_bgr: bool = False
 
     # Disabled for training because they are expensive CPU operations.
     # If required for a separate physics/debugging pipeline,
@@ -61,6 +67,20 @@ class FacePreprocessor:
     ) -> None:
 
         self.config = config or PreprocessConfig()
+        self._aligner: Optional[FaceAligner] = None
+
+    def _get_aligner(self) -> FaceAligner:
+        if self._aligner is None:
+            self._aligner = FaceAligner(output_size=self.config.image_size, align=self.config.align_face)
+        return self._aligner
+
+    def align_and_crop(self, image: np.ndarray) -> FaceAlignResult:
+        """Detect face, align, and crop. Returns status for no-face/multiple-face."""
+        rgb = self._ensure_rgb_uint8(image)
+        if self.config.align_face:
+            return self._get_aligner().process(rgb)
+        resized = self.resize(rgb)
+        return FaceAlignResult(image=resized, status=FaceDetectionStatus.OK, face_count=1)
 
     # --------------------------------------------------------
     # Convert image to RGB uint8
@@ -69,39 +89,13 @@ class FacePreprocessor:
     def _ensure_rgb_uint8(
         self,
         image: np.ndarray,
+        is_bgr: Optional[bool] = None,
     ) -> np.ndarray:
 
-        if image.dtype != np.uint8:
-
-            image = np.clip(
-                image,
-                0,
-                255,
-            ).astype(np.uint8)
-
-        if image.ndim == 2:
-
-            image = cv2.cvtColor(
-                image,
-                cv2.COLOR_GRAY2RGB,
-            )
-
-        elif image.shape[2] == 4:
-
-            image = cv2.cvtColor(
-                image,
-                cv2.COLOR_RGBA2RGB,
-            )
-
-        elif image.shape[2] == 3:
-
-            # Input from cv2.imread is BGR.
-            image = cv2.cvtColor(
-                image,
-                cv2.COLOR_BGR2RGB,
-            )
-
-        return image
+        use_bgr = is_bgr if is_bgr is not None else self.config.is_bgr
+        if use_bgr and image.ndim == 3 and image.shape[2] == 3:
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        return ensure_rgb_uint8(image)
 
     # --------------------------------------------------------
     # Optional noise reduction
@@ -193,6 +187,12 @@ class FacePreprocessor:
             image
         )
 
+        if self.config.align_face:
+            align_result = self.align_and_crop(image)
+            image = align_result.image
+        else:
+            align_result = None
+
         cfg = self.config
 
         # Optional expensive preprocessing.
@@ -228,7 +228,22 @@ class FacePreprocessor:
             image
         )
 
-        return image
+        return image, align_result
+
+    def preprocess_numpy_with_meta(
+        self,
+        image: np.ndarray,
+    ) -> Tuple[np.ndarray, Optional[FaceAlignResult]]:
+        """Like preprocess_numpy but also returns face alignment metadata."""
+        return self.preprocess_numpy(image)
+
+    def preprocess_numpy_legacy(
+        self,
+        image: np.ndarray,
+    ) -> np.ndarray:
+        """Backward-compatible: returns only the image array."""
+        out, _ = self.preprocess_numpy(image)
+        return out
 
     # --------------------------------------------------------
     # PIL preprocessing
@@ -243,7 +258,7 @@ class FacePreprocessor:
             image.convert("RGB")
         )
 
-        processed = self.preprocess_numpy(
+        processed, _ = self.preprocess_numpy(
             array
         )
 
@@ -273,8 +288,10 @@ class FacePreprocessor:
             cv2.COLOR_BGR2RGB,
         )
 
+        processed, _ = self.preprocess_numpy(rgb)
+
         return Image.fromarray(
-            self.preprocess_numpy(rgb)
+            processed
         )
 
 
@@ -336,7 +353,8 @@ def preprocess_for_model(
     image: Image.Image | np.ndarray | str,
     preprocessor: Optional[FacePreprocessor] = None,
     tensor_transform: Optional[Callable] = None,
-) -> torch.Tensor:
+    return_meta: bool = False,
+) -> torch.Tensor | Tuple[torch.Tensor, Optional[FaceAlignResult]]:
 
     pre = (
         preprocessor
@@ -350,30 +368,28 @@ def preprocess_for_model(
         else get_val_transforms()
     )
 
+    align_meta: Optional[FaceAlignResult] = None
+
     if isinstance(image, str):
-
-        pil = pre.preprocess_path(
-            image
-        )
-
+        bgr = cv2.imread(image)
+        if bgr is None:
+            raise FileNotFoundError(f"Could not read image: {image}")
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        array, align_meta = pre.preprocess_numpy(rgb)
+        pil = Image.fromarray(array)
     elif isinstance(image, np.ndarray):
-
-        pil = pre.preprocess_pil(
-            Image.fromarray(image)
-        )
-
+        array, align_meta = pre.preprocess_numpy(image)
+        pil = Image.fromarray(array)
     else:
+        array = np.array(image.convert("RGB"))
+        array, align_meta = pre.preprocess_numpy(array)
+        pil = Image.fromarray(array)
 
-        pil = pre.preprocess_pil(
-            image
-        )
-
-    tensor = tfm(
-        pil
-    )
+    tensor = tfm(pil)
 
     if tensor.dim() == 3:
-
         tensor = tensor.unsqueeze(0)
 
+    if return_meta:
+        return tensor, align_meta
     return tensor
