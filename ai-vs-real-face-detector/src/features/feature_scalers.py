@@ -1,5 +1,17 @@
-from tqdm import tqdm
+"""Fit and persist feature normalizers for training checkpoints."""
+
+from __future__ import annotations
+
 import random
+from typing import List, Sequence, Tuple
+
+import cv2
+import numpy as np
+from tqdm import tqdm
+
+from src.physics_branch.feature_vector import PhysicsFeatureExtractor
+from src.physics_branch.normalization import PhysicsNormalizer
+from src.prnu_branch.extractor import PRNUExtractor, PRNU_FEATURE_NAMES
 
 def fit_physics_and_prnu_scalers(
     sample_paths: Sequence[str],
