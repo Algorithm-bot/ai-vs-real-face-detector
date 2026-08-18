@@ -856,60 +856,295 @@ def eval_hybrid(
 # FULL HYBRID — DEEP + PHYSICS + PRNU + SEMANTIC
 # ============================================================
 
-def _full_hybrid_epoch(model, loader, criterion, device, optimizer=None) -> Dict[str, float]:
+def _full_hybrid_epoch(
+    model,
+    loader,
+    criterion,
+    device,
+    optimizer=None,
+    epoch=None,
+    total_epochs=None,
+  ) -> Dict[str, float]:
+
     training = optimizer is not None
     model.train(training)
+
     total_loss = 0.0
-    labels_all, preds_all, scores_all = [], [], []
-    context = torch.enable_grad() if training else torch.no_grad()
+    labels_all = []
+    preds_all = []
+    scores_all = []
+
+    context = (
+        torch.enable_grad()
+        if training
+        else torch.no_grad()
+    )
+
+    # ------------------------------------------------------------
+    # PROGRESS BAR
+    # ------------------------------------------------------------
+
+    if epoch is not None and total_epochs is not None:
+        phase = "Training" if training else "Validation"
+
+        progress_desc = (
+            f"Epoch {epoch}/{total_epochs} | {phase}"
+        )
+    else:
+        progress_desc = (
+            "Training" if training else "Validation"
+        )
+
+    progress_bar = tqdm(
+        loader,
+        desc=progress_desc,
+        total=len(loader),
+        leave=True,
+        dynamic_ncols=True,
+    )
+
+    # ------------------------------------------------------------
+    # PROCESS BATCHES
+    # ------------------------------------------------------------
+
     with context:
-        for batch in loader:
+
+        for batch_idx, batch in enumerate(progress_bar, start=1):
+
             try:
-                images = batch["image"].to(device, non_blocking=True)
-                physics = batch["physics"].to(device, non_blocking=True)
-                prnu = batch["prnu"].to(device, non_blocking=True)
-                semantic = batch["semantic"].to(device, non_blocking=True)
-                labels = batch["label"].to(device, non_blocking=True)
+
+                images = batch["image"].to(
+                    device,
+                    non_blocking=True,
+                )
+
+                physics = batch["physics"].to(
+                    device,
+                    non_blocking=True,
+                )
+
+                prnu = batch["prnu"].to(
+                    device,
+                    non_blocking=True,
+                )
+
+                semantic = batch["semantic"].to(
+                    device,
+                    non_blocking=True,
+                )
+
+                labels = batch["label"].to(
+                    device,
+                    non_blocking=True,
+                )
+
             except KeyError as exc:
+
                 raise RuntimeError(
-                    "full_hybrid requires image, physics, PRNU, and semantic features; "
+                    "full_hybrid requires image, physics, "
+                    "PRNU, and semantic features; "
                     f"missing {exc.args[0]!r}."
                 ) from exc
+
+            # ----------------------------------------------------
+            # FORWARD + BACKWARD
+            # ----------------------------------------------------
+
             if training:
-                optimizer.zero_grad(set_to_none=True)
-            logits, _ = model(images, physics, prnu, semantic)
-            loss = criterion(logits, labels)
+
+                optimizer.zero_grad(
+                    set_to_none=True
+                )
+
+            logits, _ = model(
+                images,
+                physics,
+                prnu,
+                semantic,
+            )
+
+            loss = criterion(
+                logits,
+                labels,
+            )
+
             if training:
+
                 loss.backward()
+
                 optimizer.step()
-            total_loss += loss.item() * images.size(0)
-            labels_all.extend(labels.detach().cpu().tolist())
-            preds_all.extend(logits.argmax(dim=1).detach().cpu().tolist())
-            scores_all.extend(torch.softmax(logits, dim=1)[:, 1].detach().cpu().tolist())
+
+            # ----------------------------------------------------
+            # METRICS
+            # ----------------------------------------------------
+
+            batch_size = images.size(0)
+
+            total_loss += (
+                loss.item() * batch_size
+            )
+
+            batch_preds = logits.argmax(
+                dim=1
+            )
+
+            batch_scores = torch.softmax(
+                logits,
+                dim=1,
+            )[:, 1]
+
+            labels_all.extend(
+                labels.detach()
+                .cpu()
+                .tolist()
+            )
+
+            preds_all.extend(
+                batch_preds.detach()
+                .cpu()
+                .tolist()
+            )
+
+            scores_all.extend(
+                batch_scores.detach()
+                .cpu()
+                .tolist()
+            )
+
+            # ----------------------------------------------------
+            # RUNNING METRICS
+            # ----------------------------------------------------
+
+            running_acc = (
+                sum(
+                    p == y
+                    for p, y in zip(
+                        preds_all,
+                        labels_all,
+                    )
+                )
+                / len(labels_all)
+            )
+
+            running_loss = (
+                total_loss
+                / len(labels_all)
+            )
+
+            # ----------------------------------------------------
+            # UPDATE PROGRESS BAR
+            # ----------------------------------------------------
+
+            progress_bar.set_postfix(
+                loss=f"{running_loss:.4f}",
+                acc=f"{running_acc:.4f}",
+                batch=f"{batch_idx}/{len(loader)}",
+            )
+
+    # ------------------------------------------------------------
+    # FINAL METRICS
+    # ------------------------------------------------------------
+
     if not labels_all:
-        raise RuntimeError("No samples were available for full_hybrid evaluation.")
-    precision, recall, f1, _ = precision_recall_fscore_support(
-        labels_all, preds_all, average="binary", zero_division=0
+
+        raise RuntimeError(
+            "No samples were available for "
+            "full_hybrid evaluation."
+        )
+
+    precision, recall, f1, _ = (
+        precision_recall_fscore_support(
+            labels_all,
+            preds_all,
+            average="binary",
+            zero_division=0,
+        )
     )
+
     metrics = {
-        "loss": total_loss / len(labels_all),
-        "acc": float(accuracy_score(labels_all, preds_all)),
-        "precision": float(precision), "recall": float(recall), "f1": float(f1),
-        "confusion_matrix": confusion_matrix(labels_all, preds_all, labels=[0, 1]).tolist(),
+
+        "loss":
+            total_loss
+            / len(labels_all),
+
+        "acc":
+            float(
+                accuracy_score(
+                    labels_all,
+                    preds_all,
+                )
+            ),
+
+        "precision":
+            float(precision),
+
+        "recall":
+            float(recall),
+
+        "f1":
+            float(f1),
+
+        "confusion_matrix":
+            confusion_matrix(
+                labels_all,
+                preds_all,
+                labels=[0, 1],
+            ).tolist(),
     }
-    # ROC-AUC is undefined for a one-class split; report it explicitly instead
-    # of silently inventing a score.
-    metrics["roc_auc"] = float(roc_auc_score(labels_all, scores_all)) if len(set(labels_all)) == 2 else None
+
+    # ROC-AUC
+    metrics["roc_auc"] = (
+        float(
+            roc_auc_score(
+                labels_all,
+                scores_all,
+            )
+        )
+        if len(set(labels_all)) == 2
+        else None
+    )
+
     return metrics
 
 
-def train_epoch_full_hybrid(model, loader, criterion, optimizer, device) -> Dict[str, float]:
-    return _full_hybrid_epoch(model, loader, criterion, device, optimizer)
+def train_epoch_full_hybrid(
+    model,
+    loader,
+    criterion,
+    optimizer,
+    device,
+    epoch,
+    total_epochs,
+):
+    return _full_hybrid_epoch(
+        model,
+        loader,
+        criterion,
+        device,
+        optimizer,
+        epoch,
+        total_epochs,
+    )
 
 
 @torch.no_grad()
-def eval_full_hybrid(model, loader, criterion, device) -> Dict[str, float]:
-    return _full_hybrid_epoch(model, loader, criterion, device)
+def eval_full_hybrid(
+    model,
+    loader,
+    criterion,
+    device,
+    epoch,
+    total_epochs,
+):
+    return _full_hybrid_epoch(
+        model,
+        loader,
+        criterion,
+        device,
+        None,
+        epoch,
+        total_epochs,
+    )
 
 
 # ============================================================
@@ -1043,13 +1278,13 @@ def run_stage1(
         args.epochs + 1,
     ):
 
-        train_metrics = train_epoch_stage1(
-            model,
-            train_loader,
-            criterion,
-            optimizer,
-            device,
-        )
+        train_metrics = train_epoch_full_hybrid(
+    model,
+    train_loader,
+    criterion,
+    optimizer,
+    device,
+)
 
         val_metrics = eval_stage1(
             model,
@@ -1377,64 +1612,305 @@ def run_hybrid(
 
 
 def run_full_hybrid(args, device) -> None:
-    """Train the four-modality model using only explicit train/val/test sets."""
+    """Train/resume the four-modality model using explicit train/val/test sets."""
+
     print("\n" + "=" * 60)
     print("FULL HYBRID TRAINING — EFFICIENTNET + PHYSICS + PRNU + ViT")
     print("=" * 60)
+
     train_loader, val_loader, test_loader = build_loaders(args)
 
-    # Fit scaling statistics solely on paths in the training split.  The
-    # normalizers are serialized into the checkpoint for identical inference.
+    # ------------------------------------------------------------
+    # Fit feature scalers ONLY on training images
+    # ------------------------------------------------------------
     from src.features.feature_scalers import fit_physics_and_prnu_scalers
-    train_paths = [path for path, _, _ in train_loader.dataset.samples]
-    physics_normalizer, prnu_normalizer = fit_physics_and_prnu_scalers(train_paths)
 
-    model = FullHybridClassifier(
-        model_name=args.backbone, semantic_model=args.semantic_model,
-        semantic_pretrained=not args.no_semantic_pretrained,
-        semantic_dim=args.semantic_dim, pretrained=not args.no_pretrained,
-        freeze_blocks=args.freeze_blocks, fusion_mode=FusionMode(args.fusion_mode),
-        normalize_physics=True, normalize_prnu=True,
-    ).to(device)
-    model.set_feature_scalers(physics_normalizer, prnu_normalizer)
-    criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.AdamW(
-        filter(lambda p: p.requires_grad, model.parameters()),
-        lr=args.lr, weight_decay=args.weight_decay,
+    train_paths = [
+        path for path, _, _ in train_loader.dataset.samples
+    ]
+
+    physics_normalizer, prnu_normalizer = (
+        fit_physics_and_prnu_scalers(train_paths)
     )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
-    best_acc, history = -1.0, []
-    for epoch in range(1, args.epochs + 1):
-        train_metrics = train_epoch_full_hybrid(model, train_loader, criterion, optimizer, device)
-        val_metrics = eval_full_hybrid(model, val_loader, criterion, device)
-        scheduler.step()
-        record = {"epoch": epoch, "train": train_metrics, "val": val_metrics}
-        history.append(record)
-        print(
-            f"[FullHybrid Epoch {epoch}/{args.epochs}] train loss={train_metrics['loss']:.4f} "
-            f"acc={train_metrics['acc']:.4f} | val loss={val_metrics['loss']:.4f} "
-            f"acc={val_metrics['acc']:.4f} f1={val_metrics['f1']:.4f}"
+
+    # ------------------------------------------------------------
+    # Create model
+    # ------------------------------------------------------------
+    model = FullHybridClassifier(
+        model_name=args.backbone,
+        semantic_model=args.semantic_model,
+        semantic_pretrained=not args.no_semantic_pretrained,
+        semantic_dim=args.semantic_dim,
+        pretrained=not args.no_pretrained,
+        freeze_blocks=args.freeze_blocks,
+        fusion_mode=FusionMode(args.fusion_mode),
+        normalize_physics=True,
+        normalize_prnu=True,
+    ).to(device)
+
+    model.set_feature_scalers(
+        physics_normalizer,
+        prnu_normalizer,
+    )
+
+    criterion = nn.CrossEntropyLoss()
+
+    optimizer = torch.optim.AdamW(
+        filter(
+            lambda p: p.requires_grad,
+            model.parameters(),
+        ),
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+    )
+
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=args.epochs,
+    )
+
+    # ------------------------------------------------------------
+    # RESUME FROM CHECKPOINT
+    # ------------------------------------------------------------
+    checkpoint_path = (
+        Path(args.output_dir)
+        / "full_hybrid_best.pt"
+    )
+
+    start_epoch = 1
+    best_acc = -1.0
+    history = []
+
+    if checkpoint_path.exists():
+
+        print("\n" + "=" * 60)
+        print("RESUMING FROM EXISTING CHECKPOINT")
+        print("=" * 60)
+        print("Checkpoint:", checkpoint_path)
+
+        checkpoint = torch.load(
+            checkpoint_path,
+            map_location=device,
+            weights_only=False,
         )
-        if val_metrics["acc"] > best_acc:
-            best_acc = val_metrics["acc"]
-            save_checkpoint(
-                Path(args.output_dir) / "full_hybrid_best.pt", model, optimizer, epoch,
-                val_metrics, "full_hybrid", args, physics_normalizer, prnu_normalizer,
+
+        # Restore model
+        model.load_state_dict(
+            checkpoint["model_state_dict"]
+        )
+
+        # Restore optimizer
+        if "optimizer_state_dict" in checkpoint:
+            optimizer.load_state_dict(
+                checkpoint["optimizer_state_dict"]
             )
 
-    # Test only after model selection; test samples are never folded into
-    # optimization or validation.
-    checkpoint_path = Path(args.output_dir) / "full_hybrid_best.pt"
+        # Restore epoch
+        previous_epoch = int(
+            checkpoint.get("epoch", 0)
+        )
+
+        start_epoch = previous_epoch + 1
+
+        # Restore best validation accuracy
+        previous_metrics = checkpoint.get(
+            "metrics", {}
+        )
+
+        best_acc = float(
+            previous_metrics.get("acc", -1.0)
+        )
+
+        # Restore scheduler position
+        for _ in range(previous_epoch):
+            scheduler.step()
+
+        print("Checkpoint epoch:", previous_epoch)
+        print("Starting from epoch:", start_epoch)
+        print("Best validation accuracy:", best_acc)
+
+        print("=" * 60)
+
+    else:
+
+        print("\nNo previous checkpoint found.")
+        print("Starting training from Epoch 1.")
+
+    # ------------------------------------------------------------
+    # TRAINING
+    # ------------------------------------------------------------
+
+    if start_epoch > args.epochs:
+
+        print("\nTraining already reached requested epoch count.")
+        print(
+            f"Checkpoint epoch = {start_epoch - 1}, "
+            f"requested epochs = {args.epochs}"
+        )
+
+    else:
+
+        for epoch in range(
+            start_epoch,
+            args.epochs + 1,
+        ):
+
+            print(
+                f"\nStarting Epoch {epoch}/{args.epochs}"
+            )
+
+            train_metrics = train_epoch_full_hybrid(
+             model,
+            train_loader,
+            criterion,
+            optimizer,
+            device,
+            epoch,
+            args.epochs,
+                    )
+
+            val_metrics = eval_full_hybrid(
+            model,
+            val_loader,
+            criterion,
+            device,
+            epoch,
+            args.epochs,
+                        )
+
+            scheduler.step()
+
+            record = {
+                "epoch": epoch,
+                "train": train_metrics,
+                "val": val_metrics,
+            }
+
+            history.append(record)
+
+            print(
+                f"[FullHybrid Epoch {epoch}/{args.epochs}] "
+                f"train loss={train_metrics['loss']:.4f} "
+                f"acc={train_metrics['acc']:.4f} | "
+                f"val loss={val_metrics['loss']:.4f} "
+                f"acc={val_metrics['acc']:.4f} "
+                f"f1={val_metrics['f1']:.4f}"
+            )
+
+            # ----------------------------------------------------
+            # SAVE LAST CHECKPOINT EVERY EPOCH
+            # ----------------------------------------------------
+
+            last_checkpoint = (
+                Path(args.output_dir)
+                / "full_hybrid_last.pt"
+            )
+
+            save_checkpoint(
+                last_checkpoint,
+                model,
+                optimizer,
+                epoch,
+                val_metrics,
+                "full_hybrid",
+                args,
+                physics_normalizer,
+                prnu_normalizer,
+            )
+
+            # ----------------------------------------------------
+            # SAVE BEST CHECKPOINT
+            # ----------------------------------------------------
+
+            if val_metrics["acc"] > best_acc:
+
+                best_acc = val_metrics["acc"]
+
+                save_checkpoint(
+                    checkpoint_path,
+                    model,
+                    optimizer,
+                    epoch,
+                    val_metrics,
+                    "full_hybrid",
+                    args,
+                    physics_normalizer,
+                    prnu_normalizer,
+                )
+
+                print(
+                    "New best checkpoint saved."
+                )
+
+    # ------------------------------------------------------------
+    # TEST BEST MODEL
+    # ------------------------------------------------------------
+
     if not checkpoint_path.exists():
-        raise RuntimeError("No full_hybrid checkpoint was saved; validation produced no epoch.")
-    best_checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    model.load_state_dict(best_checkpoint["model_state_dict"])
-    test_metrics = eval_full_hybrid(model, test_loader, criterion, device)
-    history_payload = {"epochs": history, "test": test_metrics}
-    with open(Path(args.output_dir) / "full_hybrid_history.json", "w") as f:
-        json.dump(history_payload, f, indent=2)
-    print("Held-out test metrics:", json.dumps(test_metrics, indent=2))
-    print("Checkpoint:", checkpoint_path)
+
+        raise RuntimeError(
+            "No full_hybrid checkpoint was saved."
+        )
+
+    print("\n" + "=" * 60)
+    print("LOADING BEST CHECKPOINT FOR FINAL TEST")
+    print("=" * 60)
+
+    best_checkpoint = torch.load(
+        checkpoint_path,
+        map_location=device,
+        weights_only=False,
+    )
+
+    model.load_state_dict(
+        best_checkpoint["model_state_dict"]
+    )
+
+    test_metrics = eval_full_hybrid(
+        model,
+        test_loader,
+        criterion,
+        device,
+    )
+
+    history_payload = {
+        "epochs": history,
+        "test": test_metrics,
+    }
+
+    with open(
+        Path(args.output_dir)
+        / "full_hybrid_history.json",
+        "w",
+    ) as f:
+
+        json.dump(
+            history_payload,
+            f,
+            indent=2,
+        )
+
+    print(
+        "\nHeld-out test metrics:"
+    )
+
+    print(
+        json.dumps(
+            test_metrics,
+            indent=2,
+        )
+    )
+
+    print(
+        "\nBest checkpoint:",
+        checkpoint_path,
+    )
+
+    print(
+        "Last checkpoint:",
+        Path(args.output_dir)
+        / "full_hybrid_last.pt",
+    )
 
 
 # ============================================================
