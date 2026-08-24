@@ -864,6 +864,8 @@ def _full_hybrid_epoch(
     optimizer=None,
     epoch=None,
     total_epochs=None,
+    start_batch: int = 0,
+    checkpoint_callback=None,
   ) -> Dict[str, float]:
 
     training = optimizer is not None
@@ -910,6 +912,12 @@ def _full_hybrid_epoch(
     with context:
 
         for batch_idx, batch in enumerate(progress_bar, start=1):
+
+            if batch_idx <= start_batch:
+                progress_bar.set_postfix(
+                    status=f"resuming: skipped {batch_idx}/{start_batch}"
+                )
+                continue
 
             try:
 
@@ -1041,6 +1049,19 @@ def _full_hybrid_epoch(
                 batch=f"{batch_idx}/{len(loader)}",
             )
 
+            if (
+                training
+                and checkpoint_callback is not None
+                and batch_idx % checkpoint_callback["interval"] == 0
+            ):
+                checkpoint_callback["save"](
+                    batch_idx=batch_idx,
+                    metrics={
+                        "loss": running_loss,
+                        "acc": running_acc,
+                    },
+                )
+
     # ------------------------------------------------------------
     # FINAL METRICS
     # ------------------------------------------------------------
@@ -1115,6 +1136,8 @@ def train_epoch_full_hybrid(
     device,
     epoch,
     total_epochs,
+    start_batch: int = 0,
+    checkpoint_callback=None,
 ):
     return _full_hybrid_epoch(
         model,
@@ -1124,6 +1147,8 @@ def train_epoch_full_hybrid(
         optimizer,
         epoch,
         total_epochs,
+        start_batch=start_batch,
+        checkpoint_callback=checkpoint_callback,
     )
 
 
@@ -1161,41 +1186,44 @@ def save_checkpoint(
     args,
     physics_normalizer: Optional[PhysicsNormalizer] = None,
     prnu_normalizer: Optional[PhysicsNormalizer] = None,
+    scheduler=None,
+    batch_idx: int = 0,
+    epoch_complete: bool = True,
+    best_acc: Optional[float] = None,
 ) -> None:
-
-    path.parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+    """Save a resumable training checkpoint."""
+    path.parent.mkdir(parents=True, exist_ok=True)
 
     payload = {
-            "epoch": epoch,
-
-            "model_state_dict":
-                model.state_dict(),
-
-            "optimizer_state_dict":
-                optimizer.state_dict(),
-
-            "metrics":
-                metrics,
-
-            "mode":
-                mode,
-
-            "args":
-                vars(args),
-
-            "physics_dim": PHYSICS_FEATURE_DIM,
+        "epoch": int(epoch),
+        "batch_idx": int(batch_idx),
+        "epoch_complete": bool(epoch_complete),
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "metrics": metrics,
+        "mode": mode,
+        "args": vars(args),
+        "physics_dim": PHYSICS_FEATURE_DIM,
     }
+
+    if scheduler is not None:
+        payload["scheduler_state_dict"] = scheduler.state_dict()
+
+    if best_acc is not None:
+        payload["best_acc"] = float(best_acc)
+
     if physics_normalizer is not None:
         payload["physics_normalizer"] = physics_normalizer.to_dict()
+
     if prnu_normalizer is not None:
         payload["prnu_normalizer"] = prnu_normalizer.to_dict()
+
     torch.save(payload, path)
 
     print(
-        f"Saved checkpoint: {path}"
+        f"Saved checkpoint: {path} "
+        f"(epoch={epoch}, batch={batch_idx}, "
+        f"epoch_complete={epoch_complete})"
     )
 
 
@@ -1672,68 +1700,76 @@ def run_full_hybrid(args, device) -> None:
     # ------------------------------------------------------------
     # RESUME FROM CHECKPOINT
     # ------------------------------------------------------------
-    checkpoint_path = (
-        Path(args.output_dir)
-        / "full_hybrid_best.pt"
-    )
+    # full_hybrid_last.pt  -> latest resumable training state
+    # full_hybrid_best.pt  -> best validation model for final testing
+    # full_hybrid_resume.pt -> emergency mid-epoch recovery state
+    # ------------------------------------------------------------
+    resume_checkpoint_path = Path(args.output_dir) / "full_hybrid_last.pt"
+    best_checkpoint_path = Path(args.output_dir) / "full_hybrid_best.pt"
 
     start_epoch = 1
+    start_batch = 0
     best_acc = -1.0
     history = []
 
-    if checkpoint_path.exists():
+    if resume_checkpoint_path.exists():
 
         print("\n" + "=" * 60)
-        print("RESUMING FROM EXISTING CHECKPOINT")
+        print("RESUMING FROM LAST TRAINING CHECKPOINT")
         print("=" * 60)
-        print("Checkpoint:", checkpoint_path)
+        print("Checkpoint:", resume_checkpoint_path)
 
         checkpoint = torch.load(
-            checkpoint_path,
+            resume_checkpoint_path,
             map_location=device,
             weights_only=False,
         )
 
-        # Restore model
-        model.load_state_dict(
-            checkpoint["model_state_dict"]
-        )
+        model.load_state_dict(checkpoint["model_state_dict"])
 
-        # Restore optimizer
         if "optimizer_state_dict" in checkpoint:
             optimizer.load_state_dict(
                 checkpoint["optimizer_state_dict"]
             )
 
-        # Restore epoch
-        previous_epoch = int(
-            checkpoint.get("epoch", 0)
-        )
+        # Restore scheduler state directly. Do NOT call scheduler.step()
+        # repeatedly before optimizer.step().
+        if "scheduler_state_dict" in checkpoint:
+            scheduler.load_state_dict(
+                checkpoint["scheduler_state_dict"]
+            )
 
-        start_epoch = previous_epoch + 1
+        previous_epoch = int(checkpoint.get("epoch", 0))
+        epoch_complete = bool(checkpoint.get("epoch_complete", True))
+        saved_batch = int(checkpoint.get("batch_idx", 0))
 
-        # Restore best validation accuracy
-        previous_metrics = checkpoint.get(
-            "metrics", {}
-        )
+        previous_metrics = checkpoint.get("metrics", {})
+        stored_best_acc = checkpoint.get("best_acc", None)
 
-        best_acc = float(
-            previous_metrics.get("acc", -1.0)
-        )
+        if stored_best_acc is not None:
+            best_acc = float(stored_best_acc)
+        else:
+            best_acc = float(
+                previous_metrics.get("acc", -1.0)
+            )
 
-        # Restore scheduler position
-        for _ in range(previous_epoch):
-            scheduler.step()
+        if epoch_complete:
+            start_epoch = previous_epoch + 1
+            start_batch = 0
+        else:
+            start_epoch = previous_epoch
+            start_batch = saved_batch
 
         print("Checkpoint epoch:", previous_epoch)
+        print("Checkpoint batch:", saved_batch)
+        print("Epoch complete:", epoch_complete)
         print("Starting from epoch:", start_epoch)
+        print("Starting after batch:", start_batch)
         print("Best validation accuracy:", best_acc)
-
         print("=" * 60)
 
     else:
-
-        print("\nNo previous checkpoint found.")
+        print("\nNo last training checkpoint found.")
         print("Starting training from Epoch 1.")
 
     # ------------------------------------------------------------
@@ -1750,6 +1786,11 @@ def run_full_hybrid(args, device) -> None:
 
     else:
 
+        checkpoint_interval = max(
+            1,
+            int(args.checkpoint_interval),
+        )
+
         for epoch in range(
             start_epoch,
             args.epochs + 1,
@@ -1759,25 +1800,62 @@ def run_full_hybrid(args, device) -> None:
                 f"\nStarting Epoch {epoch}/{args.epochs}"
             )
 
+            epoch_start_batch = (
+                start_batch
+                if epoch == start_epoch
+                else 0
+            )
+
+            def save_mid_epoch_checkpoint(batch_idx, metrics):
+                mid_checkpoint = (
+                    Path(args.output_dir)
+                    / "full_hybrid_resume.pt"
+                )
+
+                save_checkpoint(
+                    mid_checkpoint,
+                    model,
+                    optimizer,
+                    epoch,
+                    metrics,
+                    "full_hybrid",
+                    args,
+                    physics_normalizer,
+                    prnu_normalizer,
+                    scheduler=scheduler,
+                    batch_idx=batch_idx,
+                    epoch_complete=False,
+                    best_acc=best_acc,
+                )
+
+            checkpoint_callback = {
+                "interval": checkpoint_interval,
+                "save": save_mid_epoch_checkpoint,
+            }
+
             train_metrics = train_epoch_full_hybrid(
-             model,
-            train_loader,
-            criterion,
-            optimizer,
-            device,
-            epoch,
-            args.epochs,
-                    )
+                model,
+                train_loader,
+                criterion,
+                optimizer,
+                device,
+                epoch,
+                args.epochs,
+                start_batch=epoch_start_batch,
+                checkpoint_callback=checkpoint_callback,
+            )
 
             val_metrics = eval_full_hybrid(
-            model,
-            val_loader,
-            criterion,
-            device,
-            epoch,
-            args.epochs,
-                        )
+                model,
+                val_loader,
+                criterion,
+                device,
+                epoch,
+                args.epochs,
+            )
 
+            # Correct scheduler order: optimizer.step() happens inside the
+            # training epoch; scheduler.step() happens once afterward.
             scheduler.step()
 
             record = {
@@ -1800,7 +1878,6 @@ def run_full_hybrid(args, device) -> None:
             # ----------------------------------------------------
             # SAVE LAST CHECKPOINT EVERY EPOCH
             # ----------------------------------------------------
-
             last_checkpoint = (
                 Path(args.output_dir)
                 / "full_hybrid_last.pt"
@@ -1816,18 +1893,32 @@ def run_full_hybrid(args, device) -> None:
                 args,
                 physics_normalizer,
                 prnu_normalizer,
+                scheduler=scheduler,
+                batch_idx=len(train_loader),
+                epoch_complete=True,
+                best_acc=best_acc,
             )
+
+            # A complete epoch supersedes the mid-epoch checkpoint.
+            mid_checkpoint = (
+                Path(args.output_dir)
+                / "full_hybrid_resume.pt"
+            )
+            if mid_checkpoint.exists():
+                try:
+                    mid_checkpoint.unlink()
+                except OSError:
+                    pass
 
             # ----------------------------------------------------
             # SAVE BEST CHECKPOINT
             # ----------------------------------------------------
-
             if val_metrics["acc"] > best_acc:
 
                 best_acc = val_metrics["acc"]
 
                 save_checkpoint(
-                    checkpoint_path,
+                    best_checkpoint_path,
                     model,
                     optimizer,
                     epoch,
@@ -1836,17 +1927,21 @@ def run_full_hybrid(args, device) -> None:
                     args,
                     physics_normalizer,
                     prnu_normalizer,
+                    scheduler=scheduler,
+                    batch_idx=len(train_loader),
+                    epoch_complete=True,
+                    best_acc=best_acc,
                 )
 
-                print(
-                    "New best checkpoint saved."
-                )
+                print("New best checkpoint saved.")
+
+            start_batch = 0
 
     # ------------------------------------------------------------
     # TEST BEST MODEL
     # ------------------------------------------------------------
 
-    if not checkpoint_path.exists():
+    if not best_checkpoint_path.exists():
 
         raise RuntimeError(
             "No full_hybrid checkpoint was saved."
@@ -1857,7 +1952,7 @@ def run_full_hybrid(args, device) -> None:
     print("=" * 60)
 
     best_checkpoint = torch.load(
-        checkpoint_path,
+        best_checkpoint_path,
         map_location=device,
         weights_only=False,
     )
@@ -1903,7 +1998,7 @@ def run_full_hybrid(args, device) -> None:
 
     print(
         "\nBest checkpoint:",
-        checkpoint_path,
+        best_checkpoint_path,
     )
 
     print(
@@ -2036,6 +2131,16 @@ def parse_args():
     )
 
     parser.add_argument(
+        "--checkpoint-interval",
+        type=int,
+        default=25,
+        help=(
+            "Save an emergency mid-epoch checkpoint every N completed "
+            "batches in full_hybrid mode."
+        ),
+    )
+
+    parser.add_argument(
         "--num-workers",
         type=int,
         default=2,
@@ -2123,6 +2228,7 @@ def main() -> None:
     print("Learning rate:", args.lr)
     print("Validation ratio:", args.val_ratio)
     print("Workers:", args.num_workers)
+    print("Checkpoint interval:", args.checkpoint_interval, "batches")
     print("Seed:", args.seed)
 
     print("=" * 60)
