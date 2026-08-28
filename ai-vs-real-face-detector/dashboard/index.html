@@ -252,8 +252,36 @@
     display: block;
   }
 
+  .heatmap-stage {
+    position: relative;
+    width: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+    background: #09070d;
+  }
+  .heatmap-stage .heatmap-base,
+  .heatmap-stage .heatmap-overlay {
+    width: 100%;
+    height: auto;
+    max-height: 600px;
+    object-fit: contain;
+  }
+  .heatmap-stage .heatmap-overlay {
+    position: absolute;
+    inset: 0;
+    height: 100%;
+    object-fit: fill;
+    opacity: 0.58;
+    mix-blend-mode: screen;
+    pointer-events: none;
+  }
+
   @media (max-width: 768px) {
-    .image-display img { max-height: 420px; }
+    .image-display img,
+    .heatmap-stage .heatmap-base,
+    .heatmap-stage .heatmap-overlay { max-height: 420px; }
   }
 
   /* Physics Evidence Grid */
@@ -476,10 +504,21 @@
     const heatmapBox = document.getElementById('heatmapDisplay');
     if (data.heatmap) {
       heatmapBox.innerHTML = '';
-      const img = document.createElement('img');
-      img.src = 'data:image/png;base64,' + data.heatmap;
-      img.alt = 'Heatmap';
-      heatmapBox.appendChild(img);
+      const stage = document.createElement('div');
+      stage.className = 'heatmap-stage';
+
+      const base = document.createElement('img');
+      base.className = 'heatmap-base';
+      base.src = currentObjectUrl;
+      base.alt = 'Original image with Grad-CAM overlay';
+
+      const overlay = document.createElement('img');
+      overlay.className = 'heatmap-overlay';
+      overlay.src = 'data:image/png;base64,' + data.heatmap;
+      overlay.alt = '';
+
+      stage.append(base, overlay);
+      heatmapBox.appendChild(stage);
     } else {
       heatmapBox.innerHTML = `<div style="color: var(--text-muted); text-align: center; padding: 0 1rem;">${data.heatmap_error || 'Heatmap unavailable'}</div>`;
     }

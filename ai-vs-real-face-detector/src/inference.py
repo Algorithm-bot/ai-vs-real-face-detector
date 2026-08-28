@@ -149,6 +149,8 @@ def predict(
 
     physics_features: Optional[Dict[str, float]] = None
     physics_t: Optional[torch.Tensor] = None
+    prnu_t: Optional[torch.Tensor] = None
+    semantic_t: Optional[torch.Tensor] = None
     physics_result = None
 
     with torch.no_grad():
@@ -259,6 +261,8 @@ def predict(
                 model,
                 use_cuda=device_t.type == "cuda",
                 physics_features=physics_t,
+                prnu_features=prnu_t,
+                semantic_features=semantic_t,
             )
             try:
                 class_idx = 1 if calibrated.ai_probability > calibrated.real_probability else 0

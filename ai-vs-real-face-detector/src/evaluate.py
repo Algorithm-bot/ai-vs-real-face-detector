@@ -34,6 +34,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.inference import load_model
+from src.deep_branch.preprocessing import get_val_transforms
 from src.train import FaceBinaryDataset
 from src.calibration.calibrator import UncertaintyEstimator
 from src.classifier.ablation import ABLATION_CONFIGS, AblationVariant
@@ -90,13 +91,36 @@ def write_leakage_report(train_paths: Iterable[str], test_paths: Iterable[str], 
     output.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def _dataset_for_evaluation(data_dir: Path, checkpoint_args: dict[str, Any]):
+def _dataset_for_evaluation(
+    data_dir: Path,
+    checkpoint_args: dict[str, Any],
+    mode: str,
+):
     """Prefer an explicit test directory; otherwise mirror the training split."""
+    dataset_options = {
+        "use_physics": mode in {"hybrid", "full_hybrid"},
+        "use_prnu": mode == "full_hybrid",
+        "use_semantic": mode == "full_hybrid",
+        "semantic_model": checkpoint_args.get(
+            "semantic_model", "vit_small_patch16_224"
+        ),
+        "semantic_pretrained": checkpoint_args.get(
+            "semantic_pretrained",
+            not checkpoint_args.get("no_semantic_pretrained", False),
+        ),
+        "transform": get_val_transforms(),
+    }
     test_root = data_dir / "test"
     if (test_root / "real").exists() or (test_root / "fake").exists():
         root = test_root
         # With val_ratio=0 the train split includes every explicit test image.
-        ds = FaceBinaryDataset(str(root), split="train", val_ratio=0.0, seed=checkpoint_args.get("seed", 42), use_physics=True)
+        ds = FaceBinaryDataset(
+            str(root),
+            split="train",
+            val_ratio=0.0,
+            seed=checkpoint_args.get("seed", 42),
+            **dataset_options,
+        )
         train_root = data_dir / "train"
         if (train_root / "real").exists() or (train_root / "fake").exists():
             train_ds = FaceBinaryDataset(str(train_root), split="train", val_ratio=0.0, seed=checkpoint_args.get("seed", 42), use_physics=False)
@@ -107,8 +131,20 @@ def _dataset_for_evaluation(data_dir: Path, checkpoint_args: dict[str, Any]):
 
     val_ratio = float(checkpoint_args.get("val_ratio", 0.15))
     seed = int(checkpoint_args.get("seed", 42))
-    test_ds = FaceBinaryDataset(str(data_dir), split="val", val_ratio=val_ratio, seed=seed, use_physics=True)
-    train_ds = FaceBinaryDataset(str(data_dir), split="train", val_ratio=val_ratio, seed=seed, use_physics=True)
+    test_ds = FaceBinaryDataset(
+        str(data_dir),
+        split="val",
+        val_ratio=val_ratio,
+        seed=seed,
+        **dataset_options,
+    )
+    train_ds = FaceBinaryDataset(
+        str(data_dir),
+        split="train",
+        val_ratio=val_ratio,
+        seed=seed,
+        **dataset_options,
+    )
     return test_ds, [path for path, _, _ in train_ds.samples], "training-validation split"
 
 
@@ -137,8 +173,13 @@ def evaluate(checkpoint: Path, data_dir: Path, output_dir: Path, device_name: st
     output_dir.mkdir(parents=True, exist_ok=True)
     device = torch.device(device_name or ("cuda" if torch.cuda.is_available() else "cpu"))
     raw_checkpoint = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    mode = raw_checkpoint.get("mode", "hybrid")
     try:
-        dataset, train_paths, split_name = _dataset_for_evaluation(data_dir, raw_checkpoint.get("args", {}))
+        dataset, train_paths, split_name = _dataset_for_evaluation(
+            data_dir,
+            raw_checkpoint.get("args", {}),
+            mode,
+        )
     except FileNotFoundError as exc:
         (output_dir / "data_leakage_report.txt").write_text(
             "Data leakage report unavailable: no supported labeled test/validation images were found.\n"
@@ -157,8 +198,18 @@ def evaluate(checkpoint: Path, data_dir: Path, output_dir: Path, device_name: st
         for index in range(len(dataset)):
             item = dataset[index]
             image = item["image"].unsqueeze(0).to(device)
-            physics = item["physics"].unsqueeze(0).to(device)
-            logits, _ = model(image, physics) if mode == "hybrid" else model(image)
+            if mode == "stage1":
+                logits, _ = model(image)
+            elif mode == "hybrid":
+                physics = item["physics"].unsqueeze(0).to(device)
+                logits, _ = model(image, physics)
+            elif mode == "full_hybrid":
+                physics = item["physics"].unsqueeze(0).to(device)
+                prnu = item["prnu"].unsqueeze(0).to(device)
+                semantic = item["semantic"].unsqueeze(0).to(device)
+                logits, _ = model(image, physics, prnu, semantic)
+            else:
+                raise ValueError(f"Unsupported checkpoint mode: {mode}")
             probs = torch.softmax(logits, dim=1)[0].cpu().numpy()
             rows.append({"path": item["path"], "source": item["source"], "true_label": int(item["label"]), "predicted_label": int(np.argmax(probs)), "probability_real": float(probs[0]), "probability_ai": float(probs[1])})
 

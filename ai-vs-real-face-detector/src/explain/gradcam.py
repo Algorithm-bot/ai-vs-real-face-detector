@@ -14,7 +14,7 @@ from pytorch_grad_cam import GradCAM
 from pytorch_grad_cam.utils.image import show_cam_on_image
 from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
 
-from src.classifier.head import HybridClassifier
+from src.classifier.head import FullHybridClassifier, HybridClassifier
 from src.deep_branch.feature_extractor import DeepClassifier, DeepFeatureExtractor
 
 
@@ -33,6 +33,8 @@ class GradCAMExplainer:
         target_layers: Optional[List[nn.Module]] = None,
         use_cuda: bool = False,
         physics_features: Optional[torch.Tensor] = None,
+        prnu_features: Optional[torch.Tensor] = None,
+        semantic_features: Optional[torch.Tensor] = None,
     ) -> None:
         self.model = model
         self.device = torch.device(
@@ -64,9 +66,17 @@ class GradCAMExplainer:
         self.cam_model = self._create_cam_model()
 
         self.physics_features = None
+        self.prnu_features = None
+        self.semantic_features = None
 
         if physics_features is not None:
             self.physics_features = physics_features.to(self.device)
+
+        if prnu_features is not None:
+            self.prnu_features = prnu_features.to(self.device)
+
+        if semantic_features is not None:
+            self.semantic_features = semantic_features.to(self.device)
 
         self.cam = GradCAM(
             model=self.cam_model,
@@ -85,6 +95,9 @@ class GradCAMExplainer:
         if isinstance(model, HybridClassifier):
             backbone = model.feature_extractor.backbone
 
+        elif isinstance(model, FullHybridClassifier):
+            backbone = model.feature_extractor.backbone
+
         elif isinstance(model, DeepClassifier):
             backbone = model.feature_extractor.backbone
 
@@ -98,7 +111,7 @@ class GradCAMExplainer:
 
         # EfficientNet / timm style backbone.
         if hasattr(backbone, "blocks"):
-            return [backbone.blocks[-1]]
+            return [backbone.blocks[-3]]
 
         raise ValueError(
             "Could not automatically determine Grad-CAM target layer."
@@ -175,6 +188,46 @@ class GradCAMExplainer:
                         )
 
                     logits, _ = model(x, physics)
+
+                    return logits
+
+                if isinstance(model, FullHybridClassifier):
+
+                    batch_size = x.shape[0]
+
+                    def fixed_features(
+                        features: Optional[torch.Tensor],
+                        width: int,
+                    ) -> torch.Tensor:
+                        if features is None:
+                            return torch.zeros(
+                                batch_size,
+                                width,
+                                device=x.device,
+                                dtype=x.dtype,
+                            )
+
+                        if features.ndim == 1:
+                            features = features.unsqueeze(0)
+
+                        if features.shape[0] == 1 and batch_size > 1:
+                            features = features.expand(batch_size, -1)
+
+                        return features.to(device=x.device, dtype=x.dtype)
+
+                    physics = fixed_features(
+                        outer.physics_features,
+                        model.physics_dim,
+                    )
+                    prnu = fixed_features(
+                        outer.prnu_features,
+                        model.prnu_dim,
+                    )
+                    semantic = fixed_features(
+                        outer.semantic_features,
+                        model.semantic_dim,
+                    )
+                    logits, _ = model(x, physics, prnu, semantic)
 
                     return logits
 

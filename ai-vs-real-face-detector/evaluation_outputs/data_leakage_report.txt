@@ -1,6 +1,6 @@
 Data leakage report (SHA-256 exact-file comparison)
 
-Training images checked: 3
-Test images checked: 2
+Training images checked: 0
+Test images checked: 25781
 Overlapping test images: 0
 No exact file-hash overlap found.
