@@ -9,7 +9,7 @@ from src.deep_branch.preprocessing import FacePreprocessor, preprocess_for_model
 def test_preprocessor_output_shape():
     pre = FacePreprocessor()
     image = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
-    out = pre.preprocess_numpy(image)
+    out, _ = pre.preprocess_numpy(image)
     assert out.shape == (224, 224, 3)
     assert out.dtype == np.uint8
 

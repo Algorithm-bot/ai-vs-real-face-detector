@@ -65,18 +65,17 @@ def fit_pupil_ellipse(contour: np.ndarray) -> PupilEllipse:
     if contour is None or len(contour) < 5:
         return PupilEllipse(detected=False)
 
+    model = EllipseModel()
     try:
-        model = EllipseModel.from_estimate(contour)
+        success = model.estimate(contour)
     except (ValueError, TypeError):
-        model = None
-    if model is None:
+        success = False
+    if not success:
         return PupilEllipse(detected=False)
 
-    cx, cy = model.center
-    axis_lengths = model.axis_lengths
-    semi_major = float(max(axis_lengths))
-    semi_minor = float(min(axis_lengths))
-    theta = float(model.theta)
+    xc, yc, a, b, theta = model.params
+    semi_major = float(max(a, b))
+    semi_minor = float(min(a, b))
     if semi_major <= 0:
         return PupilEllipse(detected=False)
 
@@ -85,8 +84,8 @@ def fit_pupil_ellipse(contour: np.ndarray) -> PupilEllipse:
 
     return PupilEllipse(
         detected=True,
-        center=(float(cx), float(cy)),
-        axes=(float(semi_major), float(semi_minor)),
+        center=(float(xc), float(yc)),
+        axes=(semi_major, semi_minor),
         angle_deg=float(np.degrees(theta)),
         eccentricity=ecc,
         regularity=regularity,

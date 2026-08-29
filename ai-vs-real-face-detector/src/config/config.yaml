@@ -3,10 +3,14 @@ model:
   freeze_blocks: 5
   checkpoint_path: models/hybrid_best.pt
   stage1_checkpoint_path: models/stage1_best.pt
-  version: "0.1.0"
+  version: "0.2.0"
 
 inference:
-  confidence_threshold: 0.5
+  confidence_threshold: 0.55
+  uncertainty_threshold: 0.35
+  margin_threshold: 0.15
+  temperature: 1.0
+  align_face: true
   default_label_on_low_confidence: real
 
 physics:

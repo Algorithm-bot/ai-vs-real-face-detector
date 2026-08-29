@@ -8,6 +8,7 @@ from typing import Dict, List, Optional
 import numpy as np
 
 from .corneal_reflection import CornealReflectionResult, analyze_corneal_reflections
+from .fresnel import analyze_bilateral_fresnel
 from .iris_pupil import IrisPupilResult, analyze_iris_pupil
 from .region_detection import FaceLandmarks, FaceRegionDetector
 from .shadow_geometry import ShadowGeometryResult, analyze_shadow_geometry
@@ -79,7 +80,7 @@ class PhysicsFeatureExtractor:
     ) -> PhysicsFeatureVector:
         corneal = corneal or analyze_corneal_reflections(landmarks)
         iris_pupil = iris_pupil or analyze_iris_pupil(landmarks)
-        shadow = shadow or analyze_shadow_geometry(landmarks, corneal)
+        shadow = shadow or analyze_shadow_geometry(landmarks, corneal, image=landmarks.debug.get("source_image"))
 
         left_pupil = iris_pupil.left_pupil
         right_pupil = iris_pupil.right_pupil
@@ -121,7 +122,22 @@ class PhysicsFeatureExtractor:
     def extract(self, image: np.ndarray) -> PhysicsFeatureVector:
         detector = self._get_detector()
         landmarks = detector.detect(image)
-        return self.extract_from_landmarks(landmarks)
+        landmarks.debug["source_image"] = image
+        result = self.extract_from_landmarks(landmarks)
+        # Attach Fresnel metadata for explainability (not in model vector)
+        if landmarks.detected and landmarks.left_eye and landmarks.right_eye and result.corneal:
+            left_f, right_f, fresnel_consistency = analyze_bilateral_fresnel(
+                landmarks.left_eye, result.corneal.left,
+                landmarks.right_eye, result.corneal.right,
+            )
+            result.metadata["fresnel"] = {
+                "left_plausible": left_f.physically_plausible,
+                "right_plausible": right_f.physically_plausible,
+                "bilateral_consistency": fresnel_consistency,
+                "left_incidence_deg": left_f.incidence_angle_deg,
+                "right_incidence_deg": right_f.incidence_angle_deg,
+            }
+        return result
 
     def close(self) -> None:
         if self._owns_detector and self._detector is not None:
