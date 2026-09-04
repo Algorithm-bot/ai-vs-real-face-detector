@@ -405,6 +405,14 @@
     <div id="physicsArea" class="evidence-grid">
       </div>
 
+    <h3 class="section-title" id="prnuTitle" style="margin-top: 2.5rem; display: none;">Sensor Noise Analysis (PRNU)</h3>
+    <div id="prnuArea" class="evidence-grid" style="display: none;">
+      </div>
+
+    <h3 class="section-title" id="semanticTitle" style="margin-top: 2.5rem; display: none;">Semantic Analysis (Vision Transformer)</h3>
+    <div id="semanticArea" style="display: none;">
+      </div>
+
   </div>
 </div>
 
@@ -526,6 +534,12 @@
     // 3. Render Physics
     renderPhysics(data.physics_features);
 
+    // 4. Render PRNU (camera sensor-noise branch)
+    renderPRNU(data.prnu);
+
+    // 5. Render Semantic (ViT branch)
+    renderSemantic(data.vit_attention, data.fusion_weights, data.features_used_in_classification);
+
     // Show
     document.getElementById('results').style.display = 'block';
   }
@@ -568,6 +582,107 @@
       </div>
     `;
     area.innerHTML = html;
+  }
+
+  // --- PRNU: camera sensor-noise fingerprint branch ---
+  function renderPRNU(prnu) {
+    const title = document.getElementById('prnuTitle');
+    const area = document.getElementById('prnuArea');
+
+    // The API sends this whenever full explainability runs. If it's missing,
+    // the branch didn't run, so hide the section rather than show empty cards.
+    if (!prnu) {
+      title.style.display = 'none';
+      area.style.display = 'none';
+      return;
+    }
+    title.style.display = 'block';
+    area.style.display = 'grid';
+
+    // Reliability drives the status dot: a real camera reference is a strong
+    // signal (green); reference-free is only a weak hint (amber).
+    const hasRef = prnu.has_reference === true;
+    const dotClass = hasRef ? 'status-ok' : 'status-warn';
+    const reliabilityLabel = (prnu.reliability || 'limited').replace(/_/g, ' ');
+
+    const f = prnu.features || {};
+    // Detailed noise statistics only appear if present; each row is optional
+    // so the card stays clean when the backend omits a field.
+    const statRow = (label, key, digits = 3) =>
+      (f[key] === undefined || f[key] === null)
+        ? ''
+        : `<div class="metric-row"><span>${label}</span> <span>${num(f[key]).toFixed(digits)}</span></div>`;
+
+    area.innerHTML = `
+      <div class="evidence-card">
+        <h4><span class="status-indicator ${dotClass}"></span> Noise Fingerprint</h4>
+        <p>Real cameras leave a faint sensor-noise pattern (PRNU). Without a reference photo from the same camera, this is a supporting hint, not proof.</p>
+        <div class="metric-row"><span>PRNU Score</span> <span>${(num(prnu.score) * 100).toFixed(0)}%</span></div>
+        <div class="metric-row"><span>Reliability</span> <span style="text-transform: capitalize;">${reliabilityLabel}</span></div>
+        <div class="metric-row"><span>Camera Reference</span> <span>${hasRef ? 'Available' : 'None'}</span></div>
+        ${hasRef ? `<div class="metric-row"><span>Reference Match</span> <span>${num(prnu.reference_correlation).toFixed(3)}</span></div>` : ''}
+      </div>
+
+      <div class="evidence-card">
+        <h4><span class="status-indicator status-warn"></span> Noise Statistics</h4>
+        <p>Shape and structure of the leftover noise after denoising. AI images often have subtly different noise texture than sensor output.</p>
+        ${statRow('Std. Deviation', 'noise_std')}
+        ${statRow('Energy', 'noise_energy')}
+        ${statRow('Skew', 'noise_skew')}
+        ${statRow('Kurtosis', 'noise_kurtosis')}
+        ${statRow('Spatial Autocorr.', 'spatial_autocorr')}
+        ${statRow('High-Freq Ratio', 'high_freq_ratio')}
+      </div>
+    `;
+  }
+
+  // --- Semantic: frozen Vision Transformer branch ---
+  function renderSemantic(vitAttention, fusionWeights, featuresUsed) {
+    const title = document.getElementById('semanticTitle');
+    const area = document.getElementById('semanticArea');
+
+    const semanticInClassifier = !!(featuresUsed && featuresUsed.semantic);
+    // Show the section if the ViT ran at all: either it contributed to the
+    // decision, or it produced an attention map for explainability.
+    if (!vitAttention && !semanticInClassifier) {
+      title.style.display = 'none';
+      area.style.display = 'none';
+      return;
+    }
+    title.style.display = 'block';
+    area.style.display = 'block';
+
+    // Pull the semantic branch's fusion weight if the model exposed one.
+    let weightRow = '';
+    if (fusionWeights && (fusionWeights.semantic !== undefined && fusionWeights.semantic !== null)) {
+      weightRow = `<div class="metric-row"><span>Fusion Weight</span> <span>${(num(fusionWeights.semantic) * 100).toFixed(0)}%</span></div>`;
+    }
+
+    const roleNote = semanticInClassifier
+      ? 'The ViT reading contributes to the final verdict in this model.'
+      : 'The ViT did not feed the verdict here, but its attention map still shows where it focused.';
+
+    const attentionBlock = vitAttention
+      ? `<div class="image-panel" style="max-width: 420px;">
+           <div class="image-panel-header">ViT Attention Map</div>
+           <div class="image-display">
+             <img src="data:image/png;base64,${vitAttention}" alt="Vision Transformer attention heatmap">
+           </div>
+         </div>`
+      : `<div class="evidence-card" style="max-width: 420px;"><p style="margin: 0;">Attention map unavailable for this image.</p></div>`;
+
+    area.innerHTML = `
+      <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 1.5rem; align-items: start;">
+        <div class="evidence-card">
+          <h4><span class="status-indicator ${semanticInClassifier ? 'status-ok' : 'status-warn'}"></span> Semantic Judgment</h4>
+          <p>A frozen Vision Transformer gives a high-level "does this look like a normal image?" opinion, independent of the pixel-level checks.</p>
+          <div class="metric-row"><span>In Classifier</span> <span>${semanticInClassifier ? 'Yes' : 'Explain-only'}</span></div>
+          ${weightRow}
+          <p style="margin: 1rem 0 0; font-size: 0.8rem;">${roleNote}</p>
+        </div>
+        ${attentionBlock}
+      </div>
+    `;
   }
 </script>
 

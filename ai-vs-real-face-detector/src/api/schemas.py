@@ -24,6 +24,7 @@ class PRNUInfo(BaseModel):
     has_reference: bool = False
     reference_correlation: float = 0.0
     note: Optional[str] = None
+    features: Optional[Dict[str, float]] = None
 
 
 class FeaturesUsed(BaseModel):
