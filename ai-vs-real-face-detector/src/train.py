@@ -58,7 +58,7 @@ if str(PROJECT_ROOT) not in sys.path:
 # PROJECT IMPORTS
 # ============================================================
 
-from src.classifier.head import FullHybridClassifier, HybridClassifier
+from src.classifier.head import BranchOnlyClassifier, FullHybridClassifier, HybridClassifier
 from src.deep_branch.feature_extractor import DeepClassifier
 from src.deep_branch.preprocessing import (
     FacePreprocessor,
@@ -70,7 +70,7 @@ from src.physics_branch.feature_vector import (
     PHYSICS_FEATURE_DIM,
 )
 from src.physics_branch.normalization import PhysicsNormalizer
-from src.prnu_branch.extractor import PRNUExtractor
+from src.prnu_branch.extractor import PRNUExtractor, PRNU_FEATURE_DIM
 from src.semantic_branch.encoder import DEFAULT_VIT_MODEL, SemanticEncoder
 from src.fusion.fuse import FusionMode
 
@@ -123,35 +123,95 @@ def require_gpu() -> torch.device:
 # DATASET
 # ============================================================
 
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+CNN_REAL_DIRNAMES = {"real", "0_real"}
+CNN_FAKE_DIRNAMES = {"fake", "1_fake"}
+PHYSICS_MODES = {"hybrid", "full_hybrid", "physics_only"}
+PRNU_MODES = {"full_hybrid", "prnu_only"}
+SEMANTIC_MODES = {"full_hybrid", "semantic_only"}
+NEEDS_TEST_LOADER = {"stage1", "full_hybrid", "physics_only", "prnu_only", "semantic_only"}
+
+
+def _is_image_file(path: Path) -> bool:
+    return path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+
+
+def _label_from_dirname(name: str) -> Optional[int]:
+    if name in CNN_REAL_DIRNAMES:
+        return 0
+    if name in CNN_FAKE_DIRNAMES:
+        return 1
+    return None
+
+
+def _split_has_labels(root: Path, split: str) -> bool:
+    folder = root / split
+    if not folder.is_dir():
+        return False
+    if any((folder / name).is_dir() for name in (*CNN_REAL_DIRNAMES, *CNN_FAKE_DIRNAMES)):
+        return True
+    for dirname in (*CNN_REAL_DIRNAMES, *CNN_FAKE_DIRNAMES):
+        for _ in folder.rglob(dirname):
+            return True
+    return False
+
+
+def _source_from_relative(relative: Path, default: str) -> str:
+    parts = [p for p in relative.parts if _label_from_dirname(p) is None]
+    if not parts:
+        return default
+    return "/".join(parts)
+
+
+def collect_labeled_images(split_root: Path) -> List[Tuple[str, int, str]]:
+    """Collect (path, label, source) from real/fake or CNNDetection 0_real/1_fake trees."""
+    samples: List[Tuple[str, int, str]] = []
+    seen = set()
+    if not split_root.is_dir():
+        return samples
+
+    for folder in [split_root, *split_root.rglob("*")]:
+        if not folder.is_dir():
+            continue
+        label = _label_from_dirname(folder.name)
+        if label is None:
+            continue
+        rel_parent = folder.parent.relative_to(split_root) if folder.parent != split_root else Path()
+        default = "lsun" if label == 0 else "synthetic"
+        source = _source_from_relative(rel_parent, default)
+        for path in sorted(folder.rglob("*")):
+            if not _is_image_file(path):
+                continue
+            key = str(path.resolve())
+            if key in seen:
+                continue
+            seen.add(key)
+            nested = path.relative_to(folder)
+            if len(nested.parts) > 1:
+                item_source = "/".join(nested.parts[:-1])
+            else:
+                item_source = source
+            samples.append((str(path), label, item_source or default))
+    return samples
+
+
 class FaceBinaryDataset(Dataset):
     """
-    Dataset for REAL vs AI-GENERATED faces.
+    Dataset for REAL vs AI-GENERATED images (faces and general scenes).
 
     Supported directory structures:
 
-    data/
-    ├── real/
-    │   ├── image1.jpg
-    │   └── image2.jpg
-    │
-    └── fake/
-        ├── image1.jpg
-        └── image2.jpg
+    data/{train,val,test}/{real,fake}/...
 
-    AND recursively:
+    CNNDetection / ForenSynths layout:
 
-    data/
-    ├── real/
-    │   └── ...
-    │
-    └── fake/
-        ├── stylegan2/
-        │   ├── image1.jpg
-        │   └── image2.jpg
-        │
-        └── diffusion/
-            ├── image3.jpg
-            └── image4.jpg
+    data/{train,val,test}/{category}/0_real/
+    data/{train,val,test}/{category}/1_fake/
+
+    Nested test generators:
+
+    data/test/{generator}/{class}/0_real
+    data/test/{generator}/{class}/1_fake
 
     Labels:
 
@@ -159,12 +219,7 @@ class FaceBinaryDataset(Dataset):
         1 = FAKE / AI-GENERATED
     """
 
-    EXTENSIONS = {
-        ".jpg",
-        ".jpeg",
-        ".png",
-        ".webp",
-    }
+    EXTENSIONS = IMAGE_EXTENSIONS
 
     def __init__(
         self,
@@ -201,13 +256,13 @@ class FaceBinaryDataset(Dataset):
 
         self.transform = transform
         self.explicit_split_layout = all(
-            (self.root / split_name / class_name).is_dir()
+            _split_has_labels(self.root, split_name)
             for split_name in ("train", "val", "test")
-            for class_name in ("real", "fake")
         )
         if split == "test" and not self.explicit_split_layout:
             raise FileNotFoundError(
-                "Held-out testing requires data/{train,val,test}/{real,fake}. "
+                "Held-out testing requires data/{train,val,test} with real/fake "
+                "(or CNNDetection 0_real/1_fake) folders. "
                 "A legacy data/{real,fake} layout has no safe test split."
             )
 
@@ -228,73 +283,20 @@ class FaceBinaryDataset(Dataset):
 
         samples: List[Tuple[str, int, str]] = []
 
-        # label:
-        #   0 = real
-        #   1 = fake
-        #
-        # subdir:
-        #   real
-        #   fake
-
-        for label, subdir in (
-            (0, "real"),
-            (1, "fake"),
-        ):
-
-            folder = (
-                self.root / split / subdir
-                if self.explicit_split_layout
-                else self.root / subdir
-            )
-
-            if not folder.exists():
-                print(
-                    f"WARNING: Directory does not exist: {folder}"
-                )
-                continue
-
-            # rglob allows:
-            #
-            # fake/image.jpg
-            #
-            # AND
-            #
-            # fake/stylegan2/image.jpg
-            # fake/diffusion/image.jpg
-
-            for path in sorted(folder.rglob("*")):
-
-                if not path.is_file():
+        if self.explicit_split_layout:
+            samples = collect_labeled_images(self.root / split)
+        else:
+            for label, subdir in ((0, "real"), (1, "fake")):
+                folder = self.root / subdir
+                if not folder.exists():
+                    print(f"WARNING: Directory does not exist: {folder}")
                     continue
-
-                if path.suffix.lower() not in self.EXTENSIONS:
-                    continue
-
-                relative_path = path.relative_to(folder)
-
-                # Example:
-                #
-                # real/abc.jpg
-                # -> source = real
-                #
-                # fake/stylegan2/abc.jpg
-                # -> source = stylegan2
-                #
-                # fake/diffusion/abc.jpg
-                # -> source = diffusion
-
-                if len(relative_path.parts) > 1:
-                    source = relative_path.parts[0]
-                else:
-                    source = subdir
-
-                samples.append(
-                    (
-                        str(path),
-                        label,
-                        source,
-                    )
-                )
+                for path in sorted(folder.rglob("*")):
+                    if not path.is_file() or path.suffix.lower() not in self.EXTENSIONS:
+                        continue
+                    relative_path = path.relative_to(folder)
+                    source = relative_path.parts[0] if len(relative_path.parts) > 1 else subdir
+                    samples.append((str(path), label, source))
 
         # ----------------------------------------------------
         # Validate dataset
@@ -580,9 +582,9 @@ def build_loaders(args):
         split="train",
         val_ratio=args.val_ratio,
         seed=args.seed,
-        use_physics=args.mode in {"hybrid", "full_hybrid"},
-        use_prnu=args.mode == "full_hybrid",
-        use_semantic=args.mode == "full_hybrid",
+        use_physics=args.mode in PHYSICS_MODES,
+        use_prnu=args.mode in PRNU_MODES,
+        use_semantic=args.mode in SEMANTIC_MODES,
         semantic_model=args.semantic_model,
         semantic_pretrained=not args.no_semantic_pretrained,
         preprocessor=preprocessor,
@@ -598,9 +600,9 @@ def build_loaders(args):
         split="val",
         val_ratio=args.val_ratio,
         seed=args.seed,
-        use_physics=args.mode in {"hybrid", "full_hybrid"},
-        use_prnu=args.mode == "full_hybrid",
-        use_semantic=args.mode == "full_hybrid",
+        use_physics=args.mode in PHYSICS_MODES,
+        use_prnu=args.mode in PRNU_MODES,
+        use_semantic=args.mode in SEMANTIC_MODES,
         semantic_model=args.semantic_model,
         semantic_pretrained=not args.no_semantic_pretrained,
         preprocessor=preprocessor,
@@ -627,12 +629,14 @@ def build_loaders(args):
         pin_memory=True,
     )
 
-    if args.mode != "full_hybrid":
+    if args.mode not in NEEDS_TEST_LOADER:
         return train_loader, val_loader
 
     test_ds = FaceBinaryDataset(
         root=args.data_dir, split="test", seed=args.seed,
-        use_physics=True, use_prnu=True, use_semantic=True,
+        use_physics=args.mode in PHYSICS_MODES,
+        use_prnu=args.mode in PRNU_MODES,
+        use_semantic=args.mode in SEMANTIC_MODES,
         semantic_model=args.semantic_model, preprocessor=preprocessor,
         semantic_pretrained=not args.no_semantic_pretrained,
         transform=get_val_transforms(),
@@ -1158,8 +1162,8 @@ def eval_full_hybrid(
     loader,
     criterion,
     device,
-    epoch,
-    total_epochs,
+    epoch=None,
+    total_epochs=None,
 ):
     return _full_hybrid_epoch(
         model,
@@ -1241,9 +1245,7 @@ def run_stage1(
     print("STAGE 1 — DEEP BRANCH TRAINING")
     print("=" * 60)
 
-    train_loader, val_loader = build_loaders(
-        args
-    )
+    train_loader, val_loader, test_loader = build_loaders(args)
 
     print(
         f"\nTraining batches: {len(train_loader)}"
@@ -1297,7 +1299,7 @@ def run_stage1(
     # Training
     # --------------------------------------------------------
 
-    best_acc = 0.0
+    best_acc = -1.0
 
     history = []
 
@@ -1306,13 +1308,13 @@ def run_stage1(
         args.epochs + 1,
     ):
 
-        train_metrics = train_epoch_full_hybrid(
-    model,
-    train_loader,
-    criterion,
-    optimizer,
-    device,
-)
+        train_metrics = train_epoch_stage1(
+            model,
+            train_loader,
+            criterion,
+            optimizer,
+            device,
+        )
 
         val_metrics = eval_stage1(
             model,
@@ -1368,32 +1370,22 @@ def run_stage1(
     # Save history
     # --------------------------------------------------------
 
-    history_path = (
-        Path(args.output_dir)
-        / "stage1_history.json"
-    )
+    best_path = Path(args.output_dir) / "stage1_best.pt"
+    ckpt = torch.load(best_path, map_location=device, weights_only=False)
+    model.load_state_dict(ckpt["model_state_dict"])
+    test_metrics = eval_stage1(model, test_loader, criterion, device)
 
-    with open(
-        history_path,
-        "w",
-    ) as f:
-
-        json.dump(
-            history,
-            f,
-            indent=2,
-        )
+    history_path = Path(args.output_dir) / "stage1_history.json"
+    with open(history_path, "w") as f:
+        json.dump({"epochs": history, "test": test_metrics, "best_val_acc": best_acc}, f, indent=2)
 
     print("\n")
     print("=" * 60)
     print("STAGE 1 COMPLETE")
     print("=" * 60)
     print("Best validation accuracy:", best_acc)
-    print(
-        "Checkpoint:",
-        Path(args.output_dir)
-        / "stage1_best.pt",
-    )
+    print("Held-out test:", json.dumps(test_metrics, indent=2))
+    print("Checkpoint:", best_path)
 
 
 # ============================================================
@@ -1966,6 +1958,8 @@ def run_full_hybrid(args, device) -> None:
         test_loader,
         criterion,
         device,
+        epoch="test",
+        total_epochs="test",
     )
 
     history_payload = {
@@ -2008,6 +2002,133 @@ def run_full_hybrid(args, device) -> None:
     )
 
 
+def _feature_key_for_mode(mode: str) -> str:
+    return {
+        "physics_only": "physics",
+        "prnu_only": "prnu",
+        "semantic_only": "semantic",
+    }[mode]
+
+
+def _run_feature_epoch(
+    model,
+    loader,
+    criterion,
+    device,
+    feature_key: str,
+    optimizer=None,
+) -> Dict[str, float]:
+    training = optimizer is not None
+    model.train(training)
+    total_loss = 0.0
+    labels_all: List[int] = []
+    preds_all: List[int] = []
+    scores_all: List[float] = []
+    context = torch.enable_grad() if training else torch.no_grad()
+    with context:
+        for batch in loader:
+            feats = batch[feature_key].to(device, non_blocking=True)
+            labels = batch["label"].to(device, non_blocking=True)
+            if training:
+                optimizer.zero_grad(set_to_none=True)
+            logits, _ = model(feats)
+            loss = criterion(logits, labels)
+            if training:
+                loss.backward()
+                optimizer.step()
+            probs = torch.softmax(logits.detach(), dim=1)
+            total_loss += float(loss.item()) * labels.size(0)
+            labels_all.extend(labels.detach().cpu().tolist())
+            preds_all.extend(probs.argmax(dim=1).cpu().tolist())
+            scores_all.extend(probs[:, 1].cpu().tolist())
+    n = max(len(labels_all), 1)
+    acc = accuracy_score(labels_all, preds_all) if labels_all else 0.0
+    try:
+        auc = roc_auc_score(labels_all, scores_all) if len(set(labels_all)) == 2 else None
+    except ValueError:
+        auc = None
+    return {"loss": total_loss / n, "acc": float(acc), "roc_auc": auc}
+
+
+def run_branch_only(args, device) -> None:
+    """Train a single-branch MLP so ablations are comparable to the full model."""
+    mode = args.mode
+    feature_key = _feature_key_for_mode(mode)
+    print("\n" + "=" * 60)
+    print(f"SINGLE-BRANCH TRAINING — {mode.upper()}")
+    print("=" * 60)
+
+    train_loader, val_loader, test_loader = build_loaders(args)
+    physics_normalizer, prnu_normalizer = None, None
+    if mode in {"physics_only", "prnu_only"}:
+        from src.features.feature_scalers import fit_physics_and_prnu_scalers
+        train_paths = [path for path, _, _ in train_loader.dataset.samples]
+        physics_normalizer, prnu_normalizer = fit_physics_and_prnu_scalers(train_paths)
+
+    dims = {
+        "physics_only": PHYSICS_FEATURE_DIM,
+        "prnu_only": PRNU_FEATURE_DIM,
+        "semantic_only": args.semantic_dim,
+    }
+    model = BranchOnlyClassifier(
+        input_dim=dims[mode],
+        normalize=mode in {"physics_only", "prnu_only"},
+    ).to(device)
+    if mode == "physics_only":
+        model.set_normalizer(physics_normalizer)
+    elif mode == "prnu_only":
+        model.set_normalizer(prnu_normalizer)
+
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=args.lr, weight_decay=args.weight_decay
+    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+
+    best_acc = -1.0
+    best_path = Path(args.output_dir) / f"{mode}_best.pt"
+    last_path = Path(args.output_dir) / f"{mode}_last.pt"
+    history = []
+
+    for epoch in range(1, args.epochs + 1):
+        train_metrics = _run_feature_epoch(
+            model, train_loader, criterion, device, feature_key, optimizer
+        )
+        val_metrics = _run_feature_epoch(
+            model, val_loader, criterion, device, feature_key
+        )
+        scheduler.step()
+        history.append({"epoch": epoch, "train": train_metrics, "val": val_metrics})
+        print(
+            f"[{mode} Epoch {epoch}/{args.epochs}] "
+            f"train_acc={train_metrics['acc']:.4f} val_acc={val_metrics['acc']:.4f}"
+        )
+        save_checkpoint(
+            last_path, model, optimizer, epoch, val_metrics, mode, args,
+            physics_normalizer=physics_normalizer if mode == "physics_only" else None,
+            prnu_normalizer=prnu_normalizer if mode == "prnu_only" else None,
+            scheduler=scheduler, best_acc=best_acc,
+        )
+        if val_metrics["acc"] > best_acc:
+            best_acc = val_metrics["acc"]
+            save_checkpoint(
+                best_path, model, optimizer, epoch, val_metrics, mode, args,
+                physics_normalizer=physics_normalizer if mode == "physics_only" else None,
+                prnu_normalizer=prnu_normalizer if mode == "prnu_only" else None,
+                scheduler=scheduler, best_acc=best_acc,
+            )
+
+    ckpt = torch.load(best_path, map_location="cpu", weights_only=False)
+    model.load_state_dict(ckpt["model_state_dict"])
+    test_metrics = _run_feature_epoch(model, test_loader, criterion, device, feature_key)
+    history_path = Path(args.output_dir) / f"{mode}_history.json"
+    history_path.write_text(
+        json.dumps({"epochs": history, "test": test_metrics, "best_val_acc": best_acc}, indent=2)
+    )
+    print(json.dumps(test_metrics, indent=2))
+    print("Best checkpoint:", best_path)
+
+
 # ============================================================
 # ARGUMENTS
 # ============================================================
@@ -2016,7 +2137,7 @@ def parse_args():
 
     parser = argparse.ArgumentParser(
         description=(
-            "Train AI vs Real Face Detector "
+            "Train AI vs Real image detector "
             "(Colab/Kaggle GPU)"
         )
     )
@@ -2027,10 +2148,14 @@ def parse_args():
             "stage1",
             "hybrid",
             "full_hybrid",
+            "physics_only",
+            "prnu_only",
+            "semantic_only",
         ],
         default="stage1",
         help=(
             "stage1 = deep branch only; "
+            "physics_only / prnu_only / semantic_only = single-branch MLPs; "
             "hybrid = deep + physics; "
             "full_hybrid = deep + physics + PRNU + ViT"
         ),
@@ -2041,7 +2166,8 @@ def parse_args():
         type=str,
         default="data",
         help=(
-            "For full_hybrid: data/{train,val,test}/{real,fake}. "
+            "For full_hybrid and branch-only modes: data/{train,val,test} with "
+            "real/fake or CNNDetection 0_real/1_fake folders. "
             "Legacy stage1/hybrid also accept data/{real,fake}."
         ),
     )
@@ -2254,6 +2380,10 @@ def main() -> None:
     elif args.mode == "full_hybrid":
 
         run_full_hybrid(args, device)
+
+    elif args.mode in {"physics_only", "prnu_only", "semantic_only"}:
+
+        run_branch_only(args, device)
 
 
 # ============================================================

@@ -14,15 +14,15 @@ def test_explanation_from_physics():
         calibrated=False,
     )
     physics = {
-        "face_detected": 1.0,
-        "highlight_iou": 0.6,
-        "highlight_consistent": 1.0,
-        "light_consistent": 1.0,
-        "iris_entropy_mean": 4.2,
+        "illumination_uniformity": 0.72,
+        "high_freq_energy_ratio": 0.31,
+        "jpeg_blockiness": 0.12,
+        "shadow_coverage": 0.20,
+        "lab_chroma_std": 0.18,
     }
     text = generate_explanation(calibrated, physics_features=physics)
     assert "REAL" in text
-    assert "Physics" in text or "physics" in text.lower() or "iris" in text
+    assert "Physics" in text or "physics" in text.lower() or "illumination" in text
 
 
 def test_explanation_prnu_limited():

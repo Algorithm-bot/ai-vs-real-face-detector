@@ -8,11 +8,10 @@ from typing import List
 
 
 class AblationVariant(str, Enum):
-    EFFICIENTNET_ONLY = "efficientnet_only"
+    DEEP_ONLY = "deep_only"
     PHYSICS_ONLY = "physics_only"
-    EFFICIENTNET_PHYSICS = "efficientnet_physics"
-    EFFICIENTNET_PHYSICS_PRNU = "efficientnet_physics_prnu"
-    EFFICIENTNET_PHYSICS_VIT = "efficientnet_physics_vit"
+    PRNU_ONLY = "prnu_only"
+    SEMANTIC_ONLY = "semantic_only"
     FULL = "full"
 
 
@@ -21,61 +20,65 @@ class AblationConfig:
     """Configuration for one ablation variant."""
 
     variant: AblationVariant
+    train_mode: str
     use_deep: bool
     use_physics: bool
     use_prnu: bool
     use_semantic: bool
     description: str
+    checkpoint_name: str
 
 
 ABLATION_CONFIGS: List[AblationConfig] = [
     AblationConfig(
-        variant=AblationVariant.EFFICIENTNET_ONLY,
+        variant=AblationVariant.DEEP_ONLY,
+        train_mode="stage1",
         use_deep=True,
         use_physics=False,
         use_prnu=False,
         use_semantic=False,
-        description="EfficientNet-B0 only (stage1 baseline)",
+        description="Deep branch only (EfficientNet-B0)",
+        checkpoint_name="stage1_best.pt",
     ),
     AblationConfig(
         variant=AblationVariant.PHYSICS_ONLY,
+        train_mode="physics_only",
         use_deep=False,
         use_physics=True,
         use_prnu=False,
         use_semantic=False,
-        description="Physics features only (heuristic classifier)",
+        description="Physics branch only (scene optics/forensics)",
+        checkpoint_name="physics_only_best.pt",
     ),
     AblationConfig(
-        variant=AblationVariant.EFFICIENTNET_PHYSICS,
-        use_deep=True,
-        use_physics=True,
-        use_prnu=False,
-        use_semantic=False,
-        description="EfficientNet + Physics (original hybrid)",
-    ),
-    AblationConfig(
-        variant=AblationVariant.EFFICIENTNET_PHYSICS_PRNU,
-        use_deep=True,
-        use_physics=True,
+        variant=AblationVariant.PRNU_ONLY,
+        train_mode="prnu_only",
+        use_deep=False,
+        use_physics=False,
         use_prnu=True,
         use_semantic=False,
-        description="EfficientNet + Physics + PRNU",
+        description="PRNU branch only (sensor-noise residual)",
+        checkpoint_name="prnu_only_best.pt",
     ),
     AblationConfig(
-        variant=AblationVariant.EFFICIENTNET_PHYSICS_VIT,
-        use_deep=True,
-        use_physics=True,
+        variant=AblationVariant.SEMANTIC_ONLY,
+        train_mode="semantic_only",
+        use_deep=False,
+        use_physics=False,
         use_prnu=False,
         use_semantic=True,
-        description="EfficientNet + Physics + ViT",
+        description="Semantic branch only (ViT embedding)",
+        checkpoint_name="semantic_only_best.pt",
     ),
     AblationConfig(
         variant=AblationVariant.FULL,
+        train_mode="full_hybrid",
         use_deep=True,
         use_physics=True,
         use_prnu=True,
         use_semantic=True,
-        description="Full model: EfficientNet + Physics + PRNU + ViT",
+        description="All four branches combined",
+        checkpoint_name="full_hybrid_best.pt",
     ),
 ]
 

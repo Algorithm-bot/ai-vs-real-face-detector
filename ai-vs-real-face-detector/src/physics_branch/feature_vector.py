@@ -1,4 +1,9 @@
-"""B5 — Aggregate physics features into a single vector per image."""
+"""Aggregate physics features into a single vector per image.
+
+The classifier vector is scene-level and works on faces, objects, and
+indoor/outdoor photos. Face-specific optics stay optional metadata when a
+face happens to be present; they are not required for classification.
+"""
 
 from __future__ import annotations
 
@@ -7,6 +12,7 @@ from typing import Dict, List, Optional
 
 import numpy as np
 
+from .scene_physics import SCENE_PHYSICS_FEATURE_NAMES, extract_scene_physics
 from .corneal_reflection import CornealReflectionResult, analyze_corneal_reflections
 from .fresnel import analyze_bilateral_fresnel
 from .iris_pupil import IrisPupilResult, analyze_iris_pupil
@@ -14,30 +20,7 @@ from .region_detection import FaceLandmarks, FaceRegionDetector
 from .shadow_geometry import ShadowGeometryResult, analyze_shadow_geometry
 
 
-# Fixed feature order for reproducibility
-PHYSICS_FEATURE_NAMES: List[str] = [
-    "face_detected",
-    "highlight_iou",
-    "highlight_consistent",
-    "highlight_offset_x",
-    "highlight_offset_y",
-    "left_pupil_eccentricity",
-    "right_pupil_eccentricity",
-    "pupil_eccentricity_diff",
-    "pupil_regularity_mean",
-    "left_iris_entropy",
-    "right_iris_entropy",
-    "iris_entropy_mean",
-    "iris_entropy_diff",
-    "light_angle_diff_deg",
-    "light_cosine_similarity",
-    "light_consistent",
-    "left_highlight_detected",
-    "right_highlight_detected",
-    "left_pupil_detected",
-    "right_pupil_detected",
-]
-
+PHYSICS_FEATURE_NAMES: List[str] = list(SCENE_PHYSICS_FEATURE_NAMES)
 PHYSICS_FEATURE_DIM = len(PHYSICS_FEATURE_NAMES)
 
 
@@ -60,11 +43,16 @@ class PhysicsFeatureVector:
 
 
 class PhysicsFeatureExtractor:
-    """Run B1–B4 pipeline and return concatenated feature vector."""
+    """Scene-level physics pipeline, with optional face optics in metadata."""
 
-    def __init__(self, detector: Optional[FaceRegionDetector] = None) -> None:
+    def __init__(
+        self,
+        detector: Optional[FaceRegionDetector] = None,
+        include_face_cues: bool = False,
+    ) -> None:
         self._detector = detector
         self._owns_detector = detector is None
+        self.include_face_cues = include_face_cues
 
     def _get_detector(self) -> FaceRegionDetector:
         if self._detector is None:
@@ -78,65 +66,64 @@ class PhysicsFeatureExtractor:
         iris_pupil: Optional[IrisPupilResult] = None,
         shadow: Optional[ShadowGeometryResult] = None,
     ) -> PhysicsFeatureVector:
-        corneal = corneal or analyze_corneal_reflections(landmarks)
-        iris_pupil = iris_pupil or analyze_iris_pupil(landmarks)
-        shadow = shadow or analyze_shadow_geometry(landmarks, corneal, image=landmarks.debug.get("source_image"))
+        image = None
+        if landmarks.debug:
+            image = landmarks.debug.get("source_image")
+        if image is not None:
+            vector = extract_scene_physics(image)
+        else:
+            vector = np.zeros(PHYSICS_FEATURE_DIM, dtype=np.float32)
 
-        left_pupil = iris_pupil.left_pupil
-        right_pupil = iris_pupil.right_pupil
-        entropy_mean = (iris_pupil.left_iris_entropy + iris_pupil.right_iris_entropy) / 2.0
-        entropy_diff = abs(iris_pupil.left_iris_entropy - iris_pupil.right_iris_entropy)
+        if landmarks.detected:
+            corneal = corneal or analyze_corneal_reflections(landmarks)
+            iris_pupil = iris_pupil or analyze_iris_pupil(landmarks)
+            shadow = shadow or analyze_shadow_geometry(
+                landmarks, corneal, image=image
+            )
 
-        values = [
-            float(landmarks.detected),
-            corneal.highlight_iou,
-            float(corneal.consistent),
-            corneal.alignment_offset[0],
-            corneal.alignment_offset[1],
-            left_pupil.eccentricity,
-            right_pupil.eccentricity,
-            iris_pupil.pupil_eccentricity_diff,
-            iris_pupil.pupil_regularity_mean,
-            iris_pupil.left_iris_entropy,
-            iris_pupil.right_iris_entropy,
-            entropy_mean,
-            entropy_diff,
-            shadow.angle_difference_deg,
-            shadow.vector_cosine_similarity,
-            float(shadow.consistent),
-            float(corneal.left.detected),
-            float(corneal.right.detected),
-            float(left_pupil.detected),
-            float(right_pupil.detected),
-        ]
-
-        vector = np.array(values, dtype=np.float32)
         return PhysicsFeatureVector(
             vector=vector,
             landmarks=landmarks,
             corneal=corneal,
             iris_pupil=iris_pupil,
             shadow=shadow,
+            metadata={"face_detected": bool(landmarks.detected)},
         )
 
     def extract(self, image: np.ndarray) -> PhysicsFeatureVector:
-        detector = self._get_detector()
-        landmarks = detector.detect(image)
-        landmarks.debug["source_image"] = image
-        result = self.extract_from_landmarks(landmarks)
-        # Attach Fresnel metadata for explainability (not in model vector)
-        if landmarks.detected and landmarks.left_eye and landmarks.right_eye and result.corneal:
-            left_f, right_f, fresnel_consistency = analyze_bilateral_fresnel(
-                landmarks.left_eye, result.corneal.left,
-                landmarks.right_eye, result.corneal.right,
-            )
-            result.metadata["fresnel"] = {
-                "left_plausible": left_f.physically_plausible,
-                "right_plausible": right_f.physically_plausible,
-                "bilateral_consistency": fresnel_consistency,
-                "left_incidence_deg": left_f.incidence_angle_deg,
-                "right_incidence_deg": right_f.incidence_angle_deg,
-            }
+        vector = extract_scene_physics(image)
+        result = PhysicsFeatureVector(vector=vector)
+        if not self.include_face_cues:
+            return result
+
+        try:
+            detector = self._get_detector()
+            landmarks = detector.detect(image)
+            landmarks.debug["source_image"] = image
+            result.landmarks = landmarks
+            result.metadata["face_detected"] = bool(landmarks.detected)
+            if landmarks.detected:
+                result.corneal = analyze_corneal_reflections(landmarks)
+                result.iris_pupil = analyze_iris_pupil(landmarks)
+                result.shadow = analyze_shadow_geometry(
+                    landmarks, result.corneal, image=image
+                )
+                if landmarks.left_eye and landmarks.right_eye and result.corneal:
+                    left_f, right_f, fresnel_consistency = analyze_bilateral_fresnel(
+                        landmarks.left_eye,
+                        result.corneal.left,
+                        landmarks.right_eye,
+                        result.corneal.right,
+                    )
+                    result.metadata["fresnel"] = {
+                        "left_plausible": left_f.physically_plausible,
+                        "right_plausible": right_f.physically_plausible,
+                        "bilateral_consistency": fresnel_consistency,
+                        "left_incidence_deg": left_f.incidence_angle_deg,
+                        "right_incidence_deg": right_f.incidence_angle_deg,
+                    }
+        except Exception as exc:
+            result.metadata["face_cues_error"] = str(exc)
         return result
 
     def close(self) -> None:

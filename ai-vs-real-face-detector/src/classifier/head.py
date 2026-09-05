@@ -244,3 +244,45 @@ class FullHybridClassifier(nn.Module):
     @staticmethod
     def decode_label(class_idx: int) -> str:
         return FullHybridClassifier.LABELS[class_idx]
+
+
+class BranchOnlyClassifier(nn.Module):
+    """MLP on a single branch vector (physics, PRNU, or semantic)."""
+
+    LABELS = ("real", "ai")
+
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dims: Tuple[int, ...] = (256, 128),
+        dropout: float = 0.3,
+        num_classes: int = 2,
+        normalize: bool = False,
+    ) -> None:
+        super().__init__()
+        self.input_dim = input_dim
+        self.normalize = normalize
+        self.normalizer = PhysicsNormalizer() if normalize else None
+        self.classifier = ClassificationHead(
+            input_dim=input_dim,
+            hidden_dims=hidden_dims,
+            dropout=dropout,
+            num_classes=num_classes,
+        )
+
+    def set_normalizer(self, normalizer: Optional[PhysicsNormalizer]) -> None:
+        self.normalizer = normalizer
+
+    def _prepare(self, features: torch.Tensor) -> torch.Tensor:
+        if self.normalize and self.normalizer is not None:
+            normed = self.normalizer.normalize_batch(features.detach().cpu().numpy())
+            return torch.from_numpy(normed).to(features.device)
+        return features
+
+    def forward(self, features: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        prepared = self._prepare(features)
+        return self.classifier(prepared), prepared
+
+    def predict_proba(self, features: torch.Tensor) -> torch.Tensor:
+        logits, _ = self.forward(features)
+        return torch.softmax(logits, dim=1)

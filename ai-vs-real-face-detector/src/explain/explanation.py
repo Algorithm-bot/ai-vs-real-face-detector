@@ -33,7 +33,7 @@ def generate_explanation(
         parts.append(f"Marked uncertain due to {reason}.")
 
     if face_status and face_status != "ok":
-        parts.append(f"Face detection status: {face_status}.")
+        parts.append(f"Optional face alignment status: {face_status}.")
 
     if physics_features:
         physics_lines = _explain_physics(physics_features)
@@ -60,34 +60,28 @@ def generate_explanation(
 def _explain_physics(features: Dict[str, float]) -> List[str]:
     lines = []
 
-    if features.get("face_detected", 0) < 0.5:
-        lines.append("no face detected for physics analysis")
-        return lines
+    uniformity = features.get("illumination_uniformity")
+    if uniformity is not None:
+        lines.append(f"illumination uniformity {uniformity:.2f}")
 
-    iou = features.get("highlight_iou", 0)
-    if features.get("highlight_consistent", 0) >= 0.5:
-        lines.append(f"bilateral corneal highlights consistent (IoU={iou:.2f})")
-    else:
-        lines.append(f"bilateral corneal highlights inconsistent (IoU={iou:.2f})")
+    high_freq = features.get("high_freq_energy_ratio")
+    if high_freq is not None:
+        lines.append(f"high-frequency energy ratio {high_freq:.2f}")
 
-    light_consistent = features.get("light_consistent", 0)
-    if light_consistent >= 0.5:
-        lines.append("light direction consistent across eyes")
-    else:
-        angle = features.get("light_angle_diff_deg", 0)
-        lines.append(f"light direction mismatch ({angle:.1f}° difference)")
+    blockiness = features.get("jpeg_blockiness")
+    if blockiness is not None:
+        lines.append(f"block/grid artifact score {blockiness:.2f}")
 
-    entropy = features.get("iris_entropy_mean", 0)
-    lines.append(f"mean iris entropy {entropy:.2f}")
+    shadow = features.get("shadow_coverage")
+    if shadow is not None:
+        lines.append(f"shadow coverage {shadow:.2f}")
 
-    if features.get("fresnel_plausible", 0) >= 0.5:
-        lines.append("Fresnel reflectance physically plausible")
-    elif "fresnel_plausible" in features:
-        lines.append("Fresnel reflectance deviation detected")
+    chroma = features.get("lab_chroma_std")
+    if chroma is not None:
+        lines.append(f"chroma variation {chroma:.2f}")
 
-    if features.get("shadow_consistent", 0) >= 0.5:
-        lines.append("shadow/illumination geometry consistent")
-    elif "shadow_consistent" in features:
-        lines.append("shadow asymmetry detected")
+    texture = features.get("block_texture_regularity")
+    if texture is not None:
+        lines.append(f"block texture regularity {texture:.2f}")
 
     return lines

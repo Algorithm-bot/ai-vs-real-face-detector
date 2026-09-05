@@ -62,14 +62,26 @@ def test_fit_pupil_ellipse_on_circle():
 
 def test_physics_feature_vector_dimension():
     """Feature vector has fixed length and named fields."""
-    pytest.importorskip("mediapipe")
-    assert len(PHYSICS_FEATURE_NAMES) == PHYSICS_FEATURE_DIM
     landmarks = FaceLandmarks(detected=False, image_shape=(128, 128))
     with PhysicsFeatureExtractor() as ext:
         fv = ext.extract_from_landmarks(landmarks)
     assert fv.vector.shape == (PHYSICS_FEATURE_DIM,)
     assert fv.dim == PHYSICS_FEATURE_DIM
     assert set(fv.to_dict().keys()) == set(PHYSICS_FEATURE_NAMES)
+
+
+def test_scene_physics_extract_without_face():
+    image = np.zeros((64, 80, 3), dtype=np.uint8)
+    image[:, :40] = (30, 40, 50)
+    image[:, 40:] = (180, 170, 160)
+    with PhysicsFeatureExtractor() as ext:
+        fv = ext.extract(image)
+    assert fv.vector.shape == (PHYSICS_FEATURE_DIM,)
+    named = fv.to_dict()
+    assert "illumination_uniformity" in named
+    assert "lab_chroma_std" in named
+    assert "face_detected" not in named
+    assert 0.0 <= float(fv.vector.min()) and float(fv.vector.max()) <= 1.0
 
 
 def test_shadow_geometry_no_face():

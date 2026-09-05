@@ -550,35 +550,34 @@
       area.innerHTML = `<p style="color:var(--text-muted); grid-column: 1/-1;">Physics check bypassed or unavailable.</p>`;
       return;
     }
-    if (pf.face_detected === 0) {
-      area.innerHTML = `<p style="color:var(--text-muted); grid-column: 1/-1;">No clear face detected for optical checks.</p>`;
-      return;
-    }
-
-    const hlConsistent = pf.highlight_consistent === 1;
-    const lightConsistent = pf.light_consistent === 1;
+    const row = (label, key, digits = 2) =>
+      (pf[key] === undefined || pf[key] === null)
+        ? ''
+        : `<div class="metric-row"><span>${label}</span> <span>${num(pf[key]).toFixed(digits)}</span></div>`;
 
     const html = `
       <div class="evidence-card">
-        <h4><span class="status-indicator ${hlConsistent ? 'status-ok' : 'status-fail'}"></span> Corneal Reflection</h4>
-        <p>Measures if the light glint in both eyes matches geometry. Real photos reflect the same light source.</p>
-        <div class="metric-row"><span>Match Score (IoU)</span> <span>${(num(pf.highlight_iou) * 100).toFixed(0)}%</span></div>
-        <div class="metric-row"><span>L/R Detected</span> <span>${pf.left_highlight_detected ? 'Y' : 'N'} / ${pf.right_highlight_detected ? 'Y' : 'N'}</span></div>
+        <h4><span class="status-indicator status-warn"></span> Illumination</h4>
+        <p>Scene lighting uniformity and directional imbalance. Generators often flatten or over-smooth light.</p>
+        ${row('Uniformity', 'illumination_uniformity')}
+        ${row('L/R brightness gap', 'left_right_brightness_diff')}
+        ${row('Shadow coverage', 'shadow_coverage')}
       </div>
 
       <div class="evidence-card">
-        <h4><span class="status-indicator status-warn"></span> Pupil & Iris Shape</h4>
-        <p>Evaluates mathematical roundness and texture entropy differences between the left and right eyes.</p>
-        <div class="metric-row"><span>Roundness Score</span> <span>${(num(pf.pupil_regularity_mean) * 100).toFixed(0)}%</span></div>
-        <div class="metric-row"><span>Shape Difference</span> <span>${num(pf.pupil_eccentricity_diff).toFixed(3)}</span></div>
-        <div class="metric-row"><span>Texture Difference</span> <span>${num(pf.iris_entropy_diff).toFixed(2)}</span></div>
+        <h4><span class="status-indicator status-warn"></span> Sampling &amp; Compression</h4>
+        <p>Frequency slope, JPEG blockiness, and high-frequency energy on any photo, not just faces.</p>
+        ${row('Spectrum slope', 'radial_spectrum_slope')}
+        ${row('High-freq energy', 'high_freq_energy_ratio')}
+        ${row('JPEG blockiness', 'jpeg_blockiness')}
       </div>
 
       <div class="evidence-card">
-        <h4><span class="status-indicator ${lightConsistent ? 'status-ok' : 'status-fail'}"></span> Light Direction</h4>
-        <p>Calculates the angle of incoming light based on 3D eye mapping. Both eyes should agree.</p>
-        <div class="metric-row"><span>Angle Difference</span> <span>${num(pf.light_angle_diff_deg).toFixed(1)}°</span></div>
-        <div class="metric-row"><span>Cosine Similarity</span> <span>${num(pf.light_cosine_similarity).toFixed(3)}</span></div>
+        <h4><span class="status-indicator status-warn"></span> Color &amp; Texture</h4>
+        <p>Chromatic variation, edge-channel mismatch, and block-level texture regularity.</p>
+        ${row('Chroma std', 'lab_chroma_std')}
+        ${row('Chromatic edge gap', 'chromatic_edge_mismatch')}
+        ${row('Texture regularity', 'block_texture_regularity')}
       </div>
     `;
     area.innerHTML = html;

@@ -9,9 +9,9 @@ def test_prediction_schema_includes_physics_features():
         label="real",
         confidence_score=99.0,
         probability_distribution={"real": 99.0, "ai": 1.0},
-        physics_features={"face_detected": 1.0},
+        physics_features={"illumination_uniformity": 0.7},
     )
-    assert response.physics_features == {"face_detected": 1.0}
+    assert response.physics_features == {"illumination_uniformity": 0.7}
 
 
 def test_get_model_caches_checkpoint_load(monkeypatch, tmp_path):

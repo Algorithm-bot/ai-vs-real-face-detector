@@ -23,8 +23,8 @@ def create_app() -> FastAPI:
     cfg = get_config()
 
     app = FastAPI(
-        title="AI vs Real Face Detector",
-        description="Hybrid deep learning + physics-based face authenticity classifier",
+        title="AI vs Real Image Detector",
+        description="Hybrid deep learning + scene-physics forensic image classifier",
         version=cfg.model.version,
     )
 
@@ -48,7 +48,7 @@ def create_app() -> FastAPI:
     def root():
         return """
         <html><body style="font-family:sans-serif;padding:2rem">
-        <h1>AI vs Real Face Detector</h1>
+        <h1>AI vs Real Image Detector</h1>
         <p>API docs: <a href="/docs">/docs</a></p>
         <p>Dashboard: <a href="/dashboard/">/dashboard/</a></p>
         </body></html>

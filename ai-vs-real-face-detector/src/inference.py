@@ -23,7 +23,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.calibration.calibrator import ProbabilityCalibrator, UncertaintyEstimator
-from src.classifier.head import FullHybridClassifier, HybridClassifier
+from src.classifier.head import BranchOnlyClassifier, FullHybridClassifier, HybridClassifier
 from src.config import get_config
 from src.deep_branch.feature_extractor import DeepClassifier
 from src.deep_branch.preprocessing import FacePreprocessor, PreprocessConfig, preprocess_for_model
@@ -51,6 +51,18 @@ def load_model(checkpoint_path: str, device: torch.device):
             freeze_blocks=args.get("freeze_blocks", 5),
             pretrained=False,
         )
+    elif mode in {"physics_only", "prnu_only", "semantic_only"}:
+        from src.prnu_branch.extractor import PRNU_FEATURE_DIM
+        from src.physics_branch.feature_vector import PHYSICS_FEATURE_DIM
+        dims = {
+            "physics_only": args.get("physics_dim", PHYSICS_FEATURE_DIM),
+            "prnu_only": args.get("prnu_dim", PRNU_FEATURE_DIM),
+            "semantic_only": args.get("semantic_dim", 384),
+        }
+        model = BranchOnlyClassifier(
+            input_dim=int(dims[mode]),
+            normalize=mode in {"physics_only", "prnu_only"},
+        )
     elif mode == "full_hybrid":
         from src.fusion.fuse import FusionMode
         fusion_mode = FusionMode(args.get("fusion_mode", "concat"))
@@ -75,13 +87,17 @@ def load_model(checkpoint_path: str, device: torch.device):
             normalize_physics=args.get("normalize_physics", False),
         )
     model.load_state_dict(ckpt["model_state_dict"], strict=False)
+    from src.physics_branch.normalization import PhysicsNormalizer
     if mode == "full_hybrid" and isinstance(model, FullHybridClassifier):
-        from src.physics_branch.normalization import PhysicsNormalizer
         if ckpt.get("physics_normalizer"):
             model.set_feature_scalers(
                 PhysicsNormalizer.from_dict(ckpt["physics_normalizer"]),
                 PhysicsNormalizer.from_dict(ckpt["prnu_normalizer"]) if ckpt.get("prnu_normalizer") else None,
             )
+    elif mode in {"physics_only", "prnu_only"} and isinstance(model, BranchOnlyClassifier):
+        key = "physics_normalizer" if mode == "physics_only" else "prnu_normalizer"
+        if ckpt.get(key):
+            model.set_normalizer(PhysicsNormalizer.from_dict(ckpt[key]))
     model.to(device)
     model.eval()
     return model, mode
@@ -130,7 +146,7 @@ def predict(
     device: Optional[str] = None,
     include_heatmap: bool = True,
     include_full_explainability: bool = True,
-    align_face: bool = True,
+    align_face: bool = False,
 ) -> Dict[str, Any]:
     cfg = get_config()
     device_t = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
@@ -152,9 +168,30 @@ def predict(
     prnu_t: Optional[torch.Tensor] = None
     semantic_t: Optional[torch.Tensor] = None
     physics_result = None
+    prnu_result = None
+    semantic_result = None
 
     with torch.no_grad():
-        if mode in ("hybrid", "full_hybrid"):
+        if mode in {"physics_only", "prnu_only", "semantic_only"}:
+            with PhysicsFeatureExtractor() as physics_ext:
+                physics_result = physics_ext.extract(rgb)
+                physics_features = _enrich_physics_dict(physics_result.to_dict(), physics_result)
+                physics_t = torch.from_numpy(physics_result.vector).unsqueeze(0).to(device_t)
+            if mode == "physics_only":
+                feats = physics_t
+            elif mode == "prnu_only":
+                prnu_result = PRNUExtractor().extract(rgb)
+                prnu_t = torch.from_numpy(prnu_result.vector).unsqueeze(0).to(device_t)
+                feats = prnu_t
+            else:
+                semantic_enc = _get_semantic_encoder("vit_small_patch16_224", device_t)
+                semantic_result = semantic_enc.extract(rgb, return_attention=True)
+                semantic_t = torch.from_numpy(semantic_result.features).unsqueeze(0).to(device_t)
+                feats = semantic_t
+            logits, _ = model(feats)
+            probs = torch.softmax(logits, dim=1)[0].cpu().numpy()
+            fusion_weights = {mode.replace("_only", ""): 1.0}
+        elif mode in ("hybrid", "full_hybrid"):
             with PhysicsFeatureExtractor() as physics_ext:
                 physics_result = physics_ext.extract(rgb)
                 physics = physics_result.vector
@@ -204,7 +241,9 @@ def predict(
     )
     calibrated = uncertainty_est.decide(probs, calibrator=calibrator)
 
-    face_status = align_meta.status.value if align_meta else "ok"
+    # Face alignment is optional and disabled for general-image inference.
+    # Do not report a fabricated face when no detector was requested.
+    face_status = align_meta.status.value if align_meta else "not_requested"
 
     result: Dict[str, Any] = {
         "label": calibrated.label.value.lower().replace("_generated", ""),
@@ -221,15 +260,15 @@ def predict(
         "physics_features": physics_features,
         "face_detection": {
             "status": face_status,
-            "face_count": align_meta.face_count if align_meta else 1,
+            "face_count": align_meta.face_count if align_meta else 0,
         },
         "fusion_weights": fusion_weights,
         "model_mode": mode,
         "features_used_in_classification": {
-            "deep": True,
-            "physics": mode in ("hybrid", "full_hybrid"),
-            "prnu": mode == "full_hybrid",
-            "semantic": mode == "full_hybrid",
+            "deep": mode in {"stage1", "hybrid", "full_hybrid"},
+            "physics": mode in {"hybrid", "full_hybrid", "physics_only"},
+            "prnu": mode in {"full_hybrid", "prnu_only"},
+            "semantic": mode in {"full_hybrid", "semantic_only"},
         },
     }
 
@@ -252,7 +291,7 @@ def predict(
             physics_features=physics_features,
             prnu_result=result.get("prnu"),
             fusion_weights=fusion_weights,
-            face_status=face_status,
+            face_status=face_status if align_face else None,
         )
 
     if include_heatmap:
@@ -294,11 +333,12 @@ def predict(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run inference on a single face image")
+    parser = argparse.ArgumentParser(description="Run inference on a single image")
     parser.add_argument("image", type=str, help="Path to input image")
     parser.add_argument("--checkpoint", type=str, default="models/hybrid_best.pt")
     parser.add_argument("--no-heatmap", action="store_true")
-    parser.add_argument("--no-align", action="store_true", help="Disable face alignment (legacy mode)")
+    parser.add_argument("--no-align", action="store_true", help="Deprecated; alignment is off by default.")
+    parser.add_argument("--align-face", action="store_true", help="Crop/align a face before scoring (optional).")
     parser.add_argument("--output-json", type=str, default=None)
     args = parser.parse_args()
 
@@ -306,7 +346,7 @@ def main() -> None:
         args.image,
         args.checkpoint,
         include_heatmap=not args.no_heatmap,
-        align_face=not args.no_align,
+        align_face=args.align_face,
     )
     output = json.dumps(result, indent=2, default=str)
     print(output)

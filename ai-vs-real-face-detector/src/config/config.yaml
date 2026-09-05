@@ -10,7 +10,7 @@ inference:
   uncertainty_threshold: 0.35
   margin_threshold: 0.15
   temperature: 1.0
-  align_face: true
+  align_face: false
   default_label_on_low_confidence: real
 
 physics:

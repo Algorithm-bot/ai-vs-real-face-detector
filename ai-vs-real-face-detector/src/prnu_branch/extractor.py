@@ -114,7 +114,7 @@ def correlate_with_reference(
 
 
 class PRNUExtractor:
-    """Extract camera/noise forensic features from face images."""
+    """Extract camera/noise forensic features from arbitrary RGB images."""
 
     def __init__(
         self,

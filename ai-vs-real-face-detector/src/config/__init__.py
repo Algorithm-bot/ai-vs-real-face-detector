@@ -27,7 +27,7 @@ class InferenceConfig(BaseModel):
     uncertainty_threshold: float = 0.35
     margin_threshold: float = 0.15
     temperature: float = 1.0
-    align_face: bool = True
+    align_face: bool = False
     default_label_on_low_confidence: str = "real"
 
 

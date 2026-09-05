@@ -1,8 +1,7 @@
-"""Evaluate the saved face-authenticity checkpoint without training it.
+"""Evaluate a saved AI vs real checkpoint without training it.
 
-The expected layout is either ``data/test/{real,fake}`` (or
-``data/{train,test}/{real,fake}``) or the deterministic validation split used
-by :class:`src.train.FaceBinaryDataset`.  Labels are 0=real and 1=AI.
+Preferred layout is ``data/{train,val,test}/{real,fake}`` (nested CNNDetection
+``0_real`` / ``1_fake`` trees are also accepted). Labels are 0=real and 1=AI.
 """
 
 from __future__ import annotations
@@ -35,9 +34,9 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src.inference import load_model
 from src.deep_branch.preprocessing import get_val_transforms
-from src.train import FaceBinaryDataset
+from src.train import FaceBinaryDataset, _split_has_labels
 from src.calibration.calibrator import UncertaintyEstimator
-from src.classifier.ablation import ABLATION_CONFIGS, AblationVariant
+from src.classifier.ablation import ABLATION_CONFIGS
 
 
 def metric_summary(labels: Sequence[int], ai_probabilities: Sequence[float]) -> dict[str, Any]:
@@ -98,9 +97,9 @@ def _dataset_for_evaluation(
 ):
     """Prefer an explicit test directory; otherwise mirror the training split."""
     dataset_options = {
-        "use_physics": mode in {"hybrid", "full_hybrid"},
-        "use_prnu": mode == "full_hybrid",
-        "use_semantic": mode == "full_hybrid",
+        "use_physics": mode in {"hybrid", "full_hybrid", "physics_only"},
+        "use_prnu": mode in {"full_hybrid", "prnu_only"},
+        "use_semantic": mode in {"full_hybrid", "semantic_only"},
         "semantic_model": checkpoint_args.get(
             "semantic_model", "vit_small_patch16_224"
         ),
@@ -110,6 +109,23 @@ def _dataset_for_evaluation(
         ),
         "transform": get_val_transforms(),
     }
+    seed = int(checkpoint_args.get("seed", 42))
+    if all(_split_has_labels(data_dir, split) for split in ("train", "val", "test")):
+        ds = FaceBinaryDataset(
+            str(data_dir),
+            split="test",
+            seed=seed,
+            **dataset_options,
+        )
+        train_ds = FaceBinaryDataset(
+            str(data_dir),
+            split="train",
+            seed=seed,
+            use_physics=False,
+            transform=get_val_transforms(),
+        )
+        return ds, [path for path, _, _ in train_ds.samples], "explicit train/val/test split"
+
     test_root = data_dir / "test"
     if (test_root / "real").exists() or (test_root / "fake").exists():
         root = test_root
@@ -118,12 +134,12 @@ def _dataset_for_evaluation(
             str(root),
             split="train",
             val_ratio=0.0,
-            seed=checkpoint_args.get("seed", 42),
+            seed=seed,
             **dataset_options,
         )
         train_root = data_dir / "train"
         if (train_root / "real").exists() or (train_root / "fake").exists():
-            train_ds = FaceBinaryDataset(str(train_root), split="train", val_ratio=0.0, seed=checkpoint_args.get("seed", 42), use_physics=False)
+            train_ds = FaceBinaryDataset(str(train_root), split="train", val_ratio=0.0, seed=seed, use_physics=False)
             train_paths = [path for path, _, _ in train_ds.samples]
         else:
             train_paths = []
@@ -208,6 +224,12 @@ def evaluate(checkpoint: Path, data_dir: Path, output_dir: Path, device_name: st
                 prnu = item["prnu"].unsqueeze(0).to(device)
                 semantic = item["semantic"].unsqueeze(0).to(device)
                 logits, _ = model(image, physics, prnu, semantic)
+            elif mode == "physics_only":
+                logits, _ = model(item["physics"].unsqueeze(0).to(device))
+            elif mode == "prnu_only":
+                logits, _ = model(item["prnu"].unsqueeze(0).to(device))
+            elif mode == "semantic_only":
+                logits, _ = model(item["semantic"].unsqueeze(0).to(device))
             else:
                 raise ValueError(f"Unsupported checkpoint mode: {mode}")
             probs = torch.softmax(logits, dim=1)[0].cpu().numpy()
@@ -240,8 +262,16 @@ def evaluate(checkpoint: Path, data_dir: Path, output_dir: Path, device_name: st
             [row["probability_ai"] for row in subset],
         )
     # Generator-wise evaluation for unseen generators
-    for gen in ("stylegan2", "diffusion", "midjourney", "stable_diffusion", "dalle"):
-        gen_rows = [row for row in rows if row["source"].lower() == gen]
+    for gen in (
+        "stylegan2", "diffusion", "midjourney", "stable_diffusion", "dalle",
+        "progan", "stylegan", "biggan", "cyclegan", "stargan", "gaugan",
+        "crn", "imle", "sitd", "san", "deepfake", "whichfaceisreal", "ffhq", "lsun",
+    ):
+        gen_rows = [
+            row for row in rows
+            if row["source"].lower() == gen
+            or row["source"].lower().startswith((gen + "/", gen + "_", gen + "-"))
+        ]
         if gen_rows:
             metrics["by_generator"][gen] = metric_summary(
                 [row["true_label"] for row in gen_rows],
@@ -260,79 +290,45 @@ def run_ablation(
     output_dir: Path,
     device_name: str | None = None,
 ) -> dict[str, Any]:
-    """Compare ablation variants using available feature branches at inference."""
+    """Evaluate independently trained branch checkpoints plus the full model.
+
+    If ``checkpoint`` is a directory, look up the standard ablation filenames
+    from :data:`ABLATION_CONFIGS`. If it is a file, evaluate that checkpoint
+    only (kept for backward compatibility).
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
-    device = torch.device(device_name or ("cuda" if torch.cuda.is_available() else "cpu"))
-    raw_checkpoint = torch.load(checkpoint, map_location="cpu", weights_only=False)
-    dataset, train_paths, split_name = _dataset_for_evaluation(data_dir, raw_checkpoint.get("args", {}))
-    test_paths = [path for path, _, _ in dataset.samples]
-    write_leakage_report(train_paths, test_paths, output_dir / "data_leakage_report.txt")
+    checkpoints: dict[str, Path] = {}
+    if checkpoint.is_dir():
+        for cfg in ABLATION_CONFIGS:
+            nested = checkpoint / cfg.train_mode / cfg.checkpoint_name
+            flat = checkpoint / cfg.checkpoint_name
+            path = nested if nested.exists() else flat
+            if path.exists():
+                checkpoints[cfg.variant.value] = path
+    elif checkpoint.is_file():
+        checkpoints["single"] = checkpoint
+    else:
+        raise FileNotFoundError(f"No ablation checkpoints found at {checkpoint}")
 
-    model, mode = load_model(str(checkpoint), device)
-    results: dict[str, Any] = {"split": split_name, "variants": {}}
-
-    for cfg in ABLATION_CONFIGS:
-        rows = []
-        with torch.no_grad():
-            for index in range(len(dataset)):
-                item = dataset[index]
-                image = item["image"].unsqueeze(0).to(device)
-                physics = item["physics"].unsqueeze(0).to(device)
-
-                if cfg.use_deep and not cfg.use_physics:
-                    logits, _ = model.feature_extractor(image) if hasattr(model, "feature_extractor") else model(image)
-                    if isinstance(logits, tuple):
-                        logits = logits[0]
-                    if logits.shape[-1] != 2:
-                        from src.deep_branch.feature_extractor import DeepClassifier
-                        if isinstance(model, DeepClassifier):
-                            logits, _ = model(image)
-                        else:
-                            feat = model.feature_extractor(image)
-                            logits = torch.zeros(1, 2, device=device)
-                            logits[0, 1] = feat.mean()
-                            logits[0, 0] = -feat.mean()
-                elif cfg.use_physics and not cfg.use_deep:
-                    p = physics[0].cpu().numpy()
-                    score = float(np.mean(p))
-                    probs = np.array([1.0 - score, score])
-                    probs = np.clip(probs, 0, 1)
-                    probs = probs / probs.sum()
-                    rows.append({
-                        "true_label": int(item["label"]),
-                        "probability_ai": float(probs[1]),
-                    })
-                    continue
-                else:
-                    if mode == "hybrid":
-                        logits, _ = model(image, physics)
-                    else:
-                        logits, _ = model(image)
-                    probs = torch.softmax(logits, dim=1)[0].cpu().numpy()
-                    rows.append({
-                        "true_label": int(item["label"]),
-                        "probability_ai": float(probs[1]),
-                    })
-                    continue
-
-                probs = torch.softmax(logits, dim=1)[0].cpu().numpy()
-                rows.append({
-                    "true_label": int(item["label"]),
-                    "probability_ai": float(probs[1]),
-                })
-
-        labels = [r["true_label"] for r in rows]
-        scores = [r["probability_ai"] for r in rows]
-        results["variants"][cfg.variant.value] = {
-            "description": cfg.description,
-            "metrics": metric_summary(labels, scores),
-            "branches": {
-                "deep": cfg.use_deep,
-                "physics": cfg.use_physics,
-                "prnu": cfg.use_prnu,
-                "semantic": cfg.use_semantic,
-            },
+    results: dict[str, Any] = {"variants": {}, "comparison": []}
+    for name, path in checkpoints.items():
+        variant_dir = output_dir / name
+        metrics = evaluate(path, data_dir, variant_dir, device_name)
+        overall = metrics.get("overall", {})
+        results["variants"][name] = {
+            "checkpoint": str(path),
+            "metrics": overall,
+            "by_source": metrics.get("by_source", {}),
+            "by_generator": metrics.get("by_generator", {}),
         }
+        results["comparison"].append({
+            "variant": name,
+            "accuracy": overall.get("accuracy"),
+            "precision": overall.get("precision"),
+            "recall": overall.get("recall"),
+            "f1_score": overall.get("f1_score"),
+            "roc_auc": overall.get("roc_auc"),
+        })
 
     (output_dir / "ablation_metrics.json").write_text(
         json.dumps(results, indent=2) + "\n", encoding="utf-8"
@@ -341,12 +337,12 @@ def run_ablation(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Evaluate models/hybrid_best.pt on held-out face data")
+    parser = argparse.ArgumentParser(description="Evaluate checkpoints on held-out AI vs real images")
     parser.add_argument("--checkpoint", type=Path, default=PROJECT_ROOT / "models" / "hybrid_best.pt")
     parser.add_argument("--data-dir", type=Path, default=PROJECT_ROOT / "data")
     parser.add_argument("--output-dir", type=Path, default=PROJECT_ROOT / "evaluation_outputs")
     parser.add_argument("--device", default=None)
-    parser.add_argument("--ablation", action="store_true", help="Run ablation study")
+    parser.add_argument("--ablation", action="store_true", help="Compare independently trained branch checkpoints")
     args = parser.parse_args()
     if args.ablation:
         print(json.dumps(run_ablation(args.checkpoint, args.data_dir, args.output_dir, args.device), indent=2))
