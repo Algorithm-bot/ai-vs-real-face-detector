@@ -8,6 +8,18 @@ Usage in Colab:
 
     !python src/train.py --mode hybrid --data-dir data --epochs 15 --batch-size 32 --output-dir models
 
+Resuming:
+    Every mode (stage1, physics_only, prnu_only, semantic_only, full_hybrid)
+    writes a "<mode>_last.pt" checkpoint after each completed epoch in
+    --output-dir (full_hybrid also writes a "<mode>_resume.pt" mid-epoch
+    checkpoint every --checkpoint-interval batches). If a matching
+    "<mode>_last.pt" (or, for full_hybrid, "full_hybrid_resume.pt") already
+    exists in --output-dir the next time you run the SAME --mode with the
+    SAME --output-dir, training automatically resumes from it instead of
+    starting over -- this is what lets one model survive a Colab/Kaggle
+    session cutting off partway through. Pass --fresh to ignore an existing
+    checkpoint and start that mode from epoch 1 on purpose.
+
 Local:
     Do NOT run training loops on an 8GB RAM laptop.
     Use inference.py with a downloaded checkpoint.
@@ -1303,74 +1315,140 @@ def run_stage1(
 
     history = []
 
-    for epoch in range(
-        1,
-        args.epochs + 1,
-    ):
+    # --------------------------------------------------------
+    # RESUME FROM CHECKPOINT (epoch-level; stage1 has no mid-epoch
+    # checkpointing, so a resume repeats at most the current epoch).
+    # stage1_last.pt -> latest resumable training state
+    # stage1_best.pt -> best validation model for final testing
+    # --------------------------------------------------------
 
-        train_metrics = train_epoch_stage1(
-            model,
-            train_loader,
-            criterion,
-            optimizer,
-            device,
-        )
+    last_path = Path(args.output_dir) / "stage1_last.pt"
+    best_path = Path(args.output_dir) / "stage1_best.pt"
 
-        val_metrics = eval_stage1(
-            model,
-            val_loader,
-            criterion,
-            device,
-        )
+    start_epoch = 1
 
-        scheduler.step()
+    if last_path.exists() and not args.fresh:
 
-        record = {
-            "epoch": epoch,
-            "train": train_metrics,
-            "val": val_metrics,
-        }
+        print("\n" + "=" * 60)
+        print("RESUMING FROM LAST TRAINING CHECKPOINT")
+        print("=" * 60)
+        print("Checkpoint:", last_path)
 
-        history.append(record)
+        checkpoint = torch.load(last_path, map_location=device, weights_only=False)
 
-        print(
-            f"\n[Stage1 Epoch {epoch}/{args.epochs}] "
-            f"train loss={train_metrics['loss']:.4f} "
-            f"acc={train_metrics['acc']:.4f} | "
-            f"val loss={val_metrics['loss']:.4f} "
-            f"acc={val_metrics['acc']:.4f}"
-        )
+        model.load_state_dict(checkpoint["model_state_dict"])
 
-        # ----------------------------------------------------
-        # Save best checkpoint
-        # ----------------------------------------------------
+        if "optimizer_state_dict" in checkpoint:
+            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
 
-        if val_metrics["acc"] > best_acc:
+        if "scheduler_state_dict" in checkpoint:
+            scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
 
-            best_acc = val_metrics["acc"]
+        previous_epoch = int(checkpoint.get("epoch", 0))
+        stored_best_acc = checkpoint.get("best_acc", None)
+        if stored_best_acc is not None:
+            best_acc = float(stored_best_acc)
+
+        start_epoch = previous_epoch + 1
+
+        print("Checkpoint epoch:", previous_epoch)
+        print("Starting from epoch:", start_epoch)
+        print("Best validation accuracy so far:", best_acc)
+        print("=" * 60)
+
+    elif last_path.exists() and args.fresh:
+        print("\n--fresh set: ignoring existing stage1_last.pt, starting from Epoch 1.")
+    else:
+        print("\nNo last training checkpoint found. Starting training from Epoch 1.")
+
+    if start_epoch > args.epochs:
+
+        print("\nTraining already reached requested epoch count.")
+        print(f"Checkpoint epoch = {start_epoch - 1}, requested epochs = {args.epochs}")
+
+    else:
+
+        for epoch in range(
+            start_epoch,
+            args.epochs + 1,
+        ):
+
+            train_metrics = train_epoch_stage1(
+                model,
+                train_loader,
+                criterion,
+                optimizer,
+                device,
+            )
+
+            val_metrics = eval_stage1(
+                model,
+                val_loader,
+                criterion,
+                device,
+            )
+
+            scheduler.step()
+
+            record = {
+                "epoch": epoch,
+                "train": train_metrics,
+                "val": val_metrics,
+            }
+
+            history.append(record)
+
+            print(
+                f"\n[Stage1 Epoch {epoch}/{args.epochs}] "
+                f"train loss={train_metrics['loss']:.4f} "
+                f"acc={train_metrics['acc']:.4f} | "
+                f"val loss={val_metrics['loss']:.4f} "
+                f"acc={val_metrics['acc']:.4f}"
+            )
+
+            # ----------------------------------------------------
+            # Save last checkpoint every epoch (so a later run can resume)
+            # ----------------------------------------------------
 
             save_checkpoint(
-                Path(args.output_dir)
-                / "stage1_best.pt",
-
+                last_path,
                 model,
-
                 optimizer,
-
                 epoch,
-
                 val_metrics,
-
                 "stage1",
-
                 args,
+                scheduler=scheduler,
+                best_acc=best_acc,
             )
+
+            # ----------------------------------------------------
+            # Save best checkpoint
+            # ----------------------------------------------------
+
+            if val_metrics["acc"] > best_acc:
+
+                best_acc = val_metrics["acc"]
+
+                save_checkpoint(
+                    best_path,
+                    model,
+                    optimizer,
+                    epoch,
+                    val_metrics,
+                    "stage1",
+                    args,
+                    scheduler=scheduler,
+                    best_acc=best_acc,
+                )
 
     # --------------------------------------------------------
     # Save history
     # --------------------------------------------------------
 
-    best_path = Path(args.output_dir) / "stage1_best.pt"
+    if not best_path.exists():
+        raise RuntimeError("No stage1 checkpoint was saved.")
+
     ckpt = torch.load(best_path, map_location=device, weights_only=False)
     model.load_state_dict(ckpt["model_state_dict"])
     test_metrics = eval_stage1(model, test_loader, criterion, device)
@@ -1704,7 +1782,7 @@ def run_full_hybrid(args, device) -> None:
     best_acc = -1.0
     history = []
 
-    if resume_checkpoint_path.exists():
+    if resume_checkpoint_path.exists() and not args.fresh:
 
         print("\n" + "=" * 60)
         print("RESUMING FROM LAST TRAINING CHECKPOINT")
@@ -1760,6 +1838,8 @@ def run_full_hybrid(args, device) -> None:
         print("Best validation accuracy:", best_acc)
         print("=" * 60)
 
+    elif resume_checkpoint_path.exists() and args.fresh:
+        print("\n--fresh set: ignoring existing full_hybrid_last.pt, starting from Epoch 1.")
     else:
         print("\nNo last training checkpoint found.")
         print("Starting training from Epoch 1.")
@@ -2090,7 +2170,55 @@ def run_branch_only(args, device) -> None:
     last_path = Path(args.output_dir) / f"{mode}_last.pt"
     history = []
 
-    for epoch in range(1, args.epochs + 1):
+    # ------------------------------------------------------------
+    # RESUME FROM CHECKPOINT (epoch-level)
+    # {mode}_last.pt -> latest resumable training state
+    # {mode}_best.pt -> best validation model for final testing
+    # ------------------------------------------------------------
+
+    start_epoch = 1
+
+    if last_path.exists() and not args.fresh:
+
+        print("\n" + "=" * 60)
+        print("RESUMING FROM LAST TRAINING CHECKPOINT")
+        print("=" * 60)
+        print("Checkpoint:", last_path)
+
+        checkpoint = torch.load(last_path, map_location=device, weights_only=False)
+
+        model.load_state_dict(checkpoint["model_state_dict"])
+
+        if "optimizer_state_dict" in checkpoint:
+            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+
+        if "scheduler_state_dict" in checkpoint:
+            scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+
+        previous_epoch = int(checkpoint.get("epoch", 0))
+        stored_best_acc = checkpoint.get("best_acc", None)
+        if stored_best_acc is not None:
+            best_acc = float(stored_best_acc)
+
+        start_epoch = previous_epoch + 1
+
+        print("Checkpoint epoch:", previous_epoch)
+        print("Starting from epoch:", start_epoch)
+        print("Best validation accuracy so far:", best_acc)
+        print("=" * 60)
+
+    elif last_path.exists() and args.fresh:
+        print(f"\n--fresh set: ignoring existing {last_path.name}, starting from Epoch 1.")
+    else:
+        print("\nNo last training checkpoint found. Starting training from Epoch 1.")
+
+    if start_epoch > args.epochs:
+        print("\nTraining already reached requested epoch count.")
+        print(f"Checkpoint epoch = {start_epoch - 1}, requested epochs = {args.epochs}")
+
+    # range(start_epoch, args.epochs + 1) is naturally empty when the
+    # checkpoint already covers the requested epoch count.
+    for epoch in range(start_epoch, args.epochs + 1):
         train_metrics = _run_feature_epoch(
             model, train_loader, criterion, device, feature_key, optimizer
         )
@@ -2117,6 +2245,9 @@ def run_branch_only(args, device) -> None:
                 prnu_normalizer=prnu_normalizer if mode == "prnu_only" else None,
                 scheduler=scheduler, best_acc=best_acc,
             )
+
+    if not best_path.exists():
+        raise RuntimeError(f"No {mode} checkpoint was saved.")
 
     ckpt = torch.load(best_path, map_location="cpu", weights_only=False)
     model.load_state_dict(ckpt["model_state_dict"])
@@ -2279,6 +2410,16 @@ def parse_args():
     )
 
     parser.add_argument(
+        "--fresh",
+        action="store_true",
+        help=(
+            "Ignore any existing <mode>_last.pt checkpoint in --output-dir and "
+            "start this mode from epoch 1, instead of auto-resuming. Applies to "
+            "stage1, full_hybrid, and the branch-only modes."
+        ),
+    )
+
+    parser.add_argument(
         "--allow-cpu",
         action="store_true",
         help=(
@@ -2356,6 +2497,7 @@ def main() -> None:
     print("Workers:", args.num_workers)
     print("Checkpoint interval:", args.checkpoint_interval, "batches")
     print("Seed:", args.seed)
+    print("Fresh start (ignore existing checkpoint):", args.fresh)
 
     print("=" * 60)
 
