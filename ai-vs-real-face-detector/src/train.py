@@ -1,29 +1,4 @@
-"""
-Training script for Colab/Kaggle.
 
-NOT intended for local 8GB RAM machines.
-
-Usage in Colab:
-    !python src/train.py --mode stage1 --data-dir data --epochs 10 --batch-size 32 --output-dir models
-
-    !python src/train.py --mode hybrid --data-dir data --epochs 15 --batch-size 32 --output-dir models
-
-Resuming:
-    Every mode (stage1, physics_only, prnu_only, semantic_only, full_hybrid)
-    writes a "<mode>_last.pt" checkpoint after each completed epoch in
-    --output-dir (full_hybrid also writes a "<mode>_resume.pt" mid-epoch
-    checkpoint every --checkpoint-interval batches). If a matching
-    "<mode>_last.pt" (or, for full_hybrid, "full_hybrid_resume.pt") already
-    exists in --output-dir the next time you run the SAME --mode with the
-    SAME --output-dir, training automatically resumes from it instead of
-    starting over -- this is what lets one model survive a Colab/Kaggle
-    session cutting off partway through. Pass --fresh to ignore an existing
-    checkpoint and start that mode from epoch 1 on purpose.
-
-Local:
-    Do NOT run training loops on an 8GB RAM laptop.
-    Use inference.py with a downloaded checkpoint.
-"""
 
 from __future__ import annotations
 from tqdm import tqdm
@@ -142,6 +117,16 @@ PHYSICS_MODES = {"hybrid", "full_hybrid", "physics_only"}
 PRNU_MODES = {"full_hybrid", "prnu_only"}
 SEMANTIC_MODES = {"full_hybrid", "semantic_only"}
 NEEDS_TEST_LOADER = {"stage1", "full_hybrid", "physics_only", "prnu_only", "semantic_only"}
+
+# Set from --fast in main(): bf16 autocast for the EfficientNet forward passes.
+AMP_ENABLED = False
+
+
+def _amp_ctx():
+    return torch.autocast(
+        device_type="cuda", dtype=torch.bfloat16,
+        enabled=AMP_ENABLED and torch.cuda.is_available(),
+    )
 
 
 def _is_image_file(path: Path) -> bool:
@@ -267,6 +252,8 @@ class FaceBinaryDataset(Dataset):
         )
 
         self.transform = transform
+        self._cache_row = None
+        self._cache_arrays = None
         self.explicit_split_layout = all(
             _split_has_labels(self.root, split_name)
             for split_name in ("train", "val", "test")
@@ -463,6 +450,43 @@ class FaceBinaryDataset(Dataset):
             f"  TOTAL: {len(self.samples)}"
         )
 
+        cache_dir = os.environ.get("FEATURE_CACHE_DIR")
+        if cache_dir and (use_physics or use_prnu or use_semantic):
+            self.attach_feature_cache(cache_dir, split)
+
+    def attach_feature_cache(self, cache_dir: str, split: str) -> None:
+        """Serve physics/PRNU/semantic vectors from cache_features.py output."""
+        cache_dir = Path(cache_dir)
+        meta_path = cache_dir / "meta.json"
+        if meta_path.exists():
+            meta = json.loads(meta_path.read_text())
+            if self.use_semantic and meta.get("semantic_model") != self.semantic_model:
+                raise RuntimeError(
+                    f"Feature cache was built with semantic model "
+                    f"{meta.get('semantic_model')!r}, not {self.semantic_model!r}."
+                )
+        z = np.load(cache_dir / f"{split}.npz")
+        arrays = {k: z[k] for k in ("physics", "prnu", "semantic")}
+        row = {str(p): i for i, p in enumerate(z["paths"])}
+        kept = [s for s in self.samples if s[0] in row]
+        if len(kept) != len(self.samples):
+            print(f"  [feature cache] {split}: using {len(kept)}/{len(self.samples)} "
+                  f"images that are present in the cache")
+        if not kept:
+            raise RuntimeError(f"Feature cache has none of the {split} images.")
+        self.samples = kept
+        self._cache_row = row
+        self._cache_arrays = arrays
+        # Extractors are not needed any more; free them.
+        if self.physics_extractor is not None:
+            try:
+                self.physics_extractor.close()
+            except Exception:
+                pass
+        self.physics_extractor = None
+        self.prnu_extractor = None
+        print(f"  [feature cache] {split}: serving features from {cache_dir}")
+
     # --------------------------------------------------------
     # Dataset length
     # --------------------------------------------------------
@@ -500,7 +524,10 @@ class FaceBinaryDataset(Dataset):
         # Physics branch
         # ----------------------------------------------------
 
-        if self.use_physics:
+        if self.use_physics and self._cache_row is not None:
+            physics_vec = self._cache_arrays["physics"][self._cache_row[path]]
+
+        elif self.use_physics:
 
             physics_result = (
                 self.physics_extractor.extract(rgb)
@@ -515,14 +542,18 @@ class FaceBinaryDataset(Dataset):
                 dtype=np.float32,
             )
 
-        if self.use_prnu:
+        if self.use_prnu and self._cache_row is not None:
+            prnu_vec = self._cache_arrays["prnu"][self._cache_row[path]]
+        elif self.use_prnu:
             if self.prnu_extractor is None:
                 raise RuntimeError("PRNU extractor is unavailable for full_hybrid.")
             prnu_vec = self.prnu_extractor.extract(rgb).vector
         else:
             prnu_vec = None
 
-        if self.use_semantic:
+        if self.use_semantic and self._cache_row is not None:
+            semantic_vec = self._cache_arrays["semantic"][self._cache_row[path]]
+        elif self.use_semantic:
             # Lazy construction avoids loading a ViT in stage1/hybrid modes
             # and ensures each DataLoader worker owns its encoder safely.
             if self.semantic_extractor is None:
@@ -581,6 +612,31 @@ class FaceBinaryDataset(Dataset):
 # DATA LOADERS
 # ============================================================
 
+def subsample_balanced(samples, per_class: int, seed: int):
+    """Keep at most `per_class` images per label (0=real, 1=fake), chosen at random.
+
+    Random choice keeps the mix of LSUN categories / generators roughly
+    proportional to the full training set.
+    """
+    rng = random.Random(seed)
+    out = []
+    for label in (0, 1):
+        group = [s for s in samples if s[1] == label]
+        rng.shuffle(group)
+        out.extend(group[:per_class])
+    rng.shuffle(out)
+    return out
+
+
+def _loader_extras(args, persistent: bool = False) -> dict:
+    if args.num_workers <= 0:
+        return {}
+    extras = {"prefetch_factor": 4}
+    if persistent:
+        extras["persistent_workers"] = True
+    return extras
+
+
 def build_loaders(args):
 
     preprocessor = FacePreprocessor()
@@ -602,6 +658,14 @@ def build_loaders(args):
         preprocessor=preprocessor,
         transform=get_train_transforms(),
     )
+
+    if getattr(args, "max_train_per_class", 0) > 0:
+        before = len(train_ds.samples)
+        train_ds.samples = subsample_balanced(
+            train_ds.samples, args.max_train_per_class, args.seed
+        )
+        print(f"Training subset: {before} -> {len(train_ds.samples)} images "
+              f"(max {args.max_train_per_class} per class)")
 
     # --------------------------------------------------------
     # Validation dataset
@@ -631,6 +695,7 @@ def build_loaders(args):
         shuffle=True,
         num_workers=args.num_workers,
         pin_memory=True,
+        **_loader_extras(args, persistent=True),
     )
 
     val_loader = DataLoader(
@@ -639,6 +704,7 @@ def build_loaders(args):
         shuffle=False,
         num_workers=args.num_workers,
         pin_memory=True,
+        **_loader_extras(args),
     )
 
     if args.mode not in NEEDS_TEST_LOADER:
@@ -656,6 +722,7 @@ def build_loaders(args):
     test_loader = DataLoader(
         test_ds, batch_size=args.batch_size, shuffle=False,
         num_workers=args.num_workers, pin_memory=True,
+        **_loader_extras(args),
     )
     return train_loader, val_loader, test_loader
 
@@ -694,7 +761,9 @@ def train_epoch_stage1(
             set_to_none=True
         )
 
-        logits, _ = model(images)
+        with _amp_ctx():
+            logits, _ = model(images)
+        logits = logits.float()
 
         loss = criterion(
             logits,
@@ -752,7 +821,9 @@ def eval_stage1(
             non_blocking=True,
         )
 
-        logits, _ = model(images)
+        with _amp_ctx():
+            logits, _ = model(images)
+        logits = logits.float()
 
         loss = criterion(
             logits,
@@ -980,12 +1051,14 @@ def _full_hybrid_epoch(
                     set_to_none=True
                 )
 
-            logits, _ = model(
-                images,
-                physics,
-                prnu,
-                semantic,
-            )
+            with _amp_ctx():
+                logits, _ = model(
+                    images,
+                    physics,
+                    prnu,
+                    semantic,
+                )
+            logits = logits.float()
 
             loss = criterion(
                 logits,
@@ -2410,6 +2483,31 @@ def parse_args():
     )
 
     parser.add_argument(
+        "--max-train-per-class",
+        type=int,
+        default=0,
+        help=(
+            "If > 0, randomly keep at most this many real and this many fake "
+            "TRAIN images (val/test are untouched). 0 = use everything."
+        ),
+    )
+
+    parser.add_argument(
+        "--feature-cache",
+        type=str,
+        default="",
+        help="Directory written by src/cache_features.py. Physics/PRNU/ViT vectors are "
+             "read from it instead of being recomputed for every image every epoch.",
+    )
+
+    parser.add_argument(
+        "--fast",
+        action="store_true",
+        help="bf16 autocast + cudnn.benchmark for the EfficientNet runs "
+             "(faster, but not bit-for-bit reproducible).",
+    )
+
+    parser.add_argument(
         "--fresh",
         action="store_true",
         help=(
@@ -2437,11 +2535,19 @@ def parse_args():
 
 def main() -> None:
 
+    global AMP_ENABLED
     args = parse_args()
 
     set_seed(
         args.seed
     )
+
+    if args.feature_cache:
+        os.environ["FEATURE_CACHE_DIR"] = str(args.feature_cache)
+    if args.fast:
+        AMP_ENABLED = True
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.deterministic = False
 
     # --------------------------------------------------------
     # Device

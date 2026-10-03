@@ -23,7 +23,7 @@ The four experts are:
 | Branch | What it looks at | Numbers it produces |
 |---|---|---|
 | **Deep** | The overall look of the face, learned by a big pretrained network (EfficientNet-B0) | 1280 |
-| **Physics** | Do the eyes, reflections, light and shadows obey real-world optics? | 20 |
+| **Physics** | Does the scene's light, frequency spectrum, colour and texture look camera-real? | 22 |
 | **PRNU** | The invisible "sensor noise fingerprint" a real camera leaves behind | 9 |
 | **Semantic** | High-level "does this look normal?" judgment from a Vision Transformer (ViT) | 384 |
 
@@ -33,28 +33,224 @@ The reason for this design is defensibility: a fake image might fool the deep ne
 
 ## 3. High-level architecture
 
+This is the detailed architectural reference. It presents the system as a set of complementary **views**, each answering a different question. Section 4 then re-tells the single-image flow in plain language, and Section 7 documents every file.
+
+| View | Answers |
+|---|---|
+| **3.1 Layered component view** | What are the big pieces, and who depends on whom? |
+| **3.2 Model-mode matrix** | Which experts run, and how wide is the fused vector, per mode? |
+| **3.3 Data-shape contract** | What tensor/array shape flows across each boundary? |
+| **3.4 Inference request sequence** | What happens, step by step, for one API prediction? |
+| **3.5 Decision & calibration gate** | How is REAL / AI / UNCERTAIN chosen? |
+| **3.6 Runtime & caching lifecycle** | What is loaded once, cached, or shared? |
+| **3.7 Training plane** | How are checkpoints (and their normalizers) produced? |
+| **3.8 Result-dictionary contract** | What exactly does `predict()` return? |
+
+> **All shapes, widths, and names below were verified against the working tree on 2026-10-01.** Where earlier drafts of this document differed, the authoritative value is here and the drift is catalogued in the box at the end of 3.2.
+
+### 3.1 Layered component view
+
 ```mermaid
 flowchart TD
-    IMG["Input portrait image"] --> PRE["Preprocess and optional face align to 224x224"]
+    subgraph CLIENTS["Clients"]
+        DASH["Dashboard (browser, index.html)"]
+        CLI["CLI: python src/inference.py"]
+        EVAL["evaluate.py"]
+        TESTS["pytest suite"]
+    end
 
-    PRE --> DEEP["Deep branch: EfficientNet-B0 gives 1280 features"]
-    PRE --> PHYS["Physics branch: eyes, light, shadows give 20 features"]
-    PRE --> PRNU["PRNU branch: camera sensor noise gives 9 features"]
-    PRE --> SEM["Semantic branch: ViT-S/16 gives 384 features"]
+    subgraph SERVING["Serving layer (imports inference; never imported by it)"]
+        API["FastAPI app (api/main.py create_app)"]
+        ROUTES["Routes under /api/v1 (api/routes.py)"]
+        PGDB[("Postgres: predictions table")]
+    end
 
-    DEEP --> FUSE["Fusion: concat, gated, or attention"]
-    PHYS --> FUSE
-    PRNU --> FUSE
-    SEM --> FUSE
+    subgraph CORE["Inference core"]
+        PREDICT["inference.predict()"]
+        MCACHE["_MODEL_CACHE keyed by (checkpoint, device)"]
+    end
 
-    FUSE --> HEAD["MLP classifier gives 2 scores: real vs AI"]
-    HEAD --> CAL["Calibration and confidence check"]
-    CAL --> OUT["Verdict: REAL, AI_GENERATED, or UNCERTAIN"]
+    subgraph BRANCHES["Feature branches (core never imports the web layer)"]
+        DEEP["Deep: EfficientNet-B0 -> 1280"]
+        PHYS["Physics: scene optics -> 22"]
+        PRNU["PRNU: sensor noise -> 9"]
+        SEM["Semantic: ViT-S/16 frozen -> 384"]
+    end
 
-    HEAD --> XAI["Explainability: Grad-CAM heatmap, patch heatmap, text reasons"]
+    FUSE["Fusion: concat / gated / attention"]
+    HEAD["Classifier head -> logits (1,2)"]
+    CAL["Calibration + uncertainty gates"]
+    XAI["Explainability: Grad-CAM, ViT attention, patch localization, text"]
+
+    subgraph TRAIN["Training plane"]
+        TR["train.py (6 modes)"]
+        DS["FaceBinaryDataset"]
+        SCAL["feature_scalers (train-only fit)"]
+        FCACHE["feature cache (cache_features.py)"]
+        CKPT["checkpoints/*.pt"]
+    end
+
+    CONF["config (get_config, lru_cache)"]
+    LOG["monitoring/logger"]
+
+    DASH --> ROUTES
+    CLI --> PREDICT
+    EVAL --> PREDICT
+    TESTS --> PREDICT
+    ROUTES --> API
+    API --> PREDICT
+    ROUTES --> PGDB
+    PREDICT --> MCACHE
+    PREDICT --> BRANCHES
+    BRANCHES --> FUSE --> HEAD --> CAL
+    HEAD --> XAI
+    PREDICT --> XAI
+    CKPT --> MCACHE
+    TR --> DS
+    TR --> SCAL
+    TR --> CKPT
+    DS --> FCACHE
+    SCAL --> CKPT
+    CONF -.-> PREDICT
+    CONF -.-> API
+    LOG -.-> PREDICT
+    LOG -.-> API
 ```
 
-Not every branch is always used. Which experts speak depends on the **mode** of the loaded model (see section 5). The physics branch is used in `hybrid` and `full_hybrid`; PRNU and semantic are only used in `full_hybrid`.
+The **golden rule**: the model/feature core (`inference.py` and the branches) never imports the web framework. The API depends on inference; inference and the branches know nothing about FastAPI, so the "brains" can be tested and reused on their own.
+
+### 3.2 Model-mode matrix
+
+The checkpoint's stored `"mode"` field — read in `inference.load_model` — selects the model class, and therefore which branches run. **Six** modes exist:
+
+| Mode | Branches (feature dims) | Classifier class | Fusion & fused width | Checkpoint |
+|---|---|---|---|---|
+| `stage1` | Deep (1280) | `DeepClassifier` | none, head reads 1280 directly | `stage1_best.pt` |
+| `hybrid` | Deep (1280) + Physics (22) | `HybridClassifier` | concat → **1302** | `hybrid_best.pt` |
+| `full_hybrid` | Deep + Physics + PRNU (9) + Semantic (384) | `FullHybridClassifier` | concat/gated → **1695**, attention → **512** | `full_hybrid_best.pt` |
+| `physics_only` | Physics (22) | `BranchOnlyClassifier` | none | `physics_only_best.pt` |
+| `prnu_only` | PRNU (9) | `BranchOnlyClassifier` | none | `prnu_only_best.pt` |
+| `semantic_only` | Semantic (384) | `BranchOnlyClassifier` | none | `semantic_only_best.pt` |
+
+Fused-width math for `full_hybrid`: concat and gated keep every number, so `1280 + 22 + 9 + 384 = `**`1695`**; attention first projects each branch to 128 and concatenates, so `128 × 4 = `**`512`**. Gated learns one importance dial per branch but does **not** change the width.
+
+**Default fusion nuance:** the class-level default on `FeatureFusion`/`FullHybridClassifier` is **`concat`**, but `train.py`'s `--fusion-mode` flag defaults to **`gated`** — so a model trained through the CLI is gated unless overridden, while a bare-constructed model is concat.
+
+> **Key facts (verified in code, 2026-10-01) — where earlier prose in this document differs:**
+> - **Physics is 22 scene-level features**, produced by `physics_branch/scene_physics.py::extract_scene_physics` (illumination, shadow/highlight, frequency-spectrum, colour and texture statistics) — **not** 20 eye-optics features. The eye-optics modules (`corneal_reflection`, `iris_pupil`, `shadow_geometry`, `fresnel`) still exist but now contribute **optional metadata** only, when `include_face_cues=True`. (§7.3 and §9 are corrected to match.)
+> - **Fused widths:** hybrid **1302** (not 1300), full_hybrid concat/gated **1695** (not 1693).
+> - **`stage1` training works:** `run_stage1` correctly calls `train_epoch_stage1` (`train.py:1474`). The earlier "stage1 is broken" note (§11) was stale.
+> - **Six modes:** `physics_only`, `prnu_only`, `semantic_only` exist in addition to the three in §5.
+> - **A feature-cache path** (`--feature-cache` → `FEATURE_CACHE_DIR`, `cache_features.py`, `train_cached.py`) exists and is not in the §6 repo map.
+
+### 3.3 Data-shape contract
+
+A single prediction is a chain of shape transformations. This is the contract each boundary must honour:
+
+| Stage | Produced by | Shape / type |
+|---|---|---|
+| Raw image | `cv2.imread` → `cvtColor` to RGB | `(H, W, 3)` uint8 |
+| Model input tensor | `preprocess_for_model` (resize 224, ImageNet-normalize) | `(1, 3, 224, 224)` float32 |
+| Deep features | EfficientNet-B0 (`num_classes=0`, avg pool) | `(1, 1280)` |
+| Physics vector | `extract_scene_physics` → `(22,)` → unsqueeze | `(1, 22)` float32 |
+| PRNU vector | `PRNUExtractor.extract` → `(9,)` → unsqueeze | `(1, 9)` float32 |
+| Semantic embedding | frozen ViT-S/16 | `(1, 384)` float32 |
+| Fused vector (`full_hybrid`) | `FeatureFusion.fuse` | `(1, 1695)` concat/gated **or** `(1, 512)` attention |
+| Logits | `ClassificationHead` | `(1, 2)` |
+| Probabilities | softmax + temperature scaling | `(2,)` → `{real, ai}` |
+| Decision | `UncertaintyEstimator.decide` | `CalibratedPrediction` (label ∈ REAL / AI_GENERATED / UNCERTAIN) |
+
+Every end-to-end model returns a tuple `(logits, deep_features)`; the `(1, 1280)` deep features are handed to Grad-CAM so the heatmap targets the EfficientNet layer that actually drove the score.
+
+### 3.4 Inference request sequence
+
+```mermaid
+sequenceDiagram
+    participant U as Browser (dashboard)
+    participant R as API routes
+    participant P as inference.predict
+    participant M as _MODEL_CACHE
+    participant B as Branches + fusion + head
+    participant C as Calibration
+    participant X as Explainability
+    participant D as Postgres
+
+    U->>R: POST /api/v1/predict (multipart file)
+    R->>R: validate (format, size <= 10MB, 32..4096 px)
+    R->>P: predict(tmp_path, checkpoint, align_face)
+    P->>M: get_model(checkpoint, device)
+    M-->>P: cached (model, mode) [loaded once at startup]
+    P->>B: run only the branches this mode needs -> fuse -> head
+    B-->>P: logits (1,2), deep_features (1,1280)
+    P->>C: calibrate_probs then decide (entropy / margin / confidence)
+    C-->>P: CalibratedPrediction
+    P->>X: Grad-CAM + ViT attention + patch localization + text
+    X-->>P: base64 images + explanation
+    P-->>R: result dictionary
+    R->>D: create_prediction(result)
+    R-->>U: PredictionResponse (JSON)
+```
+
+The branch step is mode-gated inside `predict`: branch-only modes extract a single vector; `hybrid` adds physics; `full_hybrid` additionally adds PRNU + semantic and asks the model for real per-branch fusion weights; `stage1` runs the image alone. For explainability the semantic and PRNU branches may be computed even when a mode does not use them in classification.
+
+### 3.5 Decision & calibration gate
+
+Probabilities pass through three rejection gates **in order**; the first that trips wins. Thresholds come from `config.yaml` (via `InferenceConfig`), so caution is tunable without touching code.
+
+```mermaid
+flowchart TD
+    P["probs: real vs ai"] --> T["temperature scaling (calibrate_probs)"]
+    T --> E{"entropy > 0.35?"}
+    E -- yes --> U1["UNCERTAIN: high_entropy"]
+    E -- no --> M{"margin < 0.15?"}
+    M -- yes --> U2["UNCERTAIN: low_margin"]
+    M -- no --> CF{"confidence < 0.55?"}
+    CF -- yes --> U3["UNCERTAIN: low_confidence"]
+    CF -- no --> D{"ai > real?"}
+    D -- yes --> AI["AI_GENERATED"]
+    D -- no --> R["REAL"]
+```
+
+`UncertaintyEstimator.decide` returns a `CalibratedPrediction` dataclass (`label`, `real_probability`, `ai_probability`, `confidence`, `uncertainty`, `calibrated`, `rejection_reason`); `label` holds the `LabelDecision` enum value.
+
+### 3.6 Runtime & caching lifecycle
+
+- **Load once, reuse everywhere.** The API builds the model at startup: `create_app` → `routes.configure` → `get_model`, which populates a process-wide, lock-guarded `_MODEL_CACHE`. Every `/predict` re-calls `get_model` but hits the same entry, so all requests share one in-memory model.
+- **Cache keys.** `_MODEL_CACHE` is keyed by `(resolved_checkpoint_path, device_string)` → `(model, mode)`. A separate `_SEMANTIC_CACHE` holds frozen ViT encoders keyed by `(model_name, pretrained, device)`.
+- **Device.** `cuda` if available, else `cpu`; overridable per call. Grad-CAM mirrors the chosen device.
+- **Config & logging are singletons.** `get_config()` is `lru_cache`-wrapped (one `AppConfig` per process); the logger is a module-level singleton writing to both stdout and `logs/app.log`.
+- **Normalizers travel in the checkpoint.** The fitted physics/PRNU scalers are **not** part of `model_state_dict`; they are stored as plain dicts and re-attached at load via `set_feature_scalers`.
+
+### 3.7 Training plane
+
+```mermaid
+flowchart TD
+    DATA["data/ (train|val|test, or legacy real|fake)"] --> DS["FaceBinaryDataset -> dict: image,label,physics,prnu?,semantic?"]
+    DS --> TRAINP["train-only image paths"]
+    TRAINP --> FIT["fit_physics_and_prnu_scalers (<=300 sampled, seeded)"]
+    FIT --> INJ["model.set_feature_scalers(physics, prnu)"]
+    DS --> LOOP["epoch loop: AdamW + CosineAnnealingLR + CrossEntropyLoss"]
+    INJ --> LOOP
+    LOOP --> BEST["<mode>_best.pt on val-accuracy improvement"]
+    LOOP --> LAST["<mode>_last.pt each epoch (resume point)"]
+    FIT --> BEST
+    BEST --> TEST["held-out test eval -> <mode>_history.json"]
+```
+
+- **Leakage guard.** Scalers are fitted on **training image paths only** (a deterministic ≤300 sample), then injected into the model and serialized into the checkpoint — so inference reproduces the exact training-time normalization and never peeks at val/test.
+- **Checkpoint payload.** `epoch`, `batch_idx`, `epoch_complete`, `model_state_dict`, `optimizer_state_dict`, optional `scheduler_state_dict`, `metrics`, `mode`, `args` (the seed lives here), `physics_dim`, optional `best_acc`, and for `full_hybrid` the `physics_normalizer` / `prnu_normalizer` dicts.
+- **Resume.** `full_hybrid` resumes from `full_hybrid_last.pt` unless `--fresh` is passed. (The module docstring mentions a `full_hybrid_resume.pt`, but the code only ever loads `_last.pt`.)
+- **Optional feature cache.** `--feature-cache` precomputes physics/PRNU/ViT vectors to disk (`FEATURE_CACHE_DIR`) so repeated runs skip re-extraction.
+
+### 3.8 Result-dictionary contract
+
+`predict()` returns one dictionary; `api/schemas.py::PredictionResponse` mirrors it and the dashboard reads a subset. **Always present:**
+
+`label` (lowercased short form: `real`/`ai`/`uncertain`), `decision` (`REAL`/`AI_GENERATED`/`UNCERTAIN`), `confidence_score` (percent), `uncertainty` (normalized entropy), `probability_distribution` (`{real, ai}` percents), `calibrated`, `rejection_reason`, `heatmap`, `physics_features`, `face_detection` (`{status, face_count}`), `fusion_weights`, `model_mode`, `features_used_in_classification` (`{deep, physics, prnu, semantic}`).
+
+**Added conditionally:** `prnu` (score/reliability/features/note), `vit_attention` (base64 PNG), `explanation` (text), `heatmap` or `heatmap_error`, `suspicious_regions` + `localization_heatmap` + `patch_scores` (or `localization_error`).
+
+The dashboard reads `label`, `confidence_score`, `probability_distribution`, `heatmap`, `physics_features` (its three evidence cards), `prnu`, `vit_attention`, `fusion_weights`, and `features_used_in_classification`.
 
 ---
 
@@ -86,9 +282,11 @@ The same code can run three increasingly powerful configurations. The mode is st
 
 | Mode | Experts used | Fusion input width | Typical checkpoint | Status |
 |---|---|---|---|---|
-| `stage1` | Deep only | 1280 | `stage1_best.pt` | Image-only baseline. **Training path is currently broken — see section 11.** |
-| `hybrid` | Deep + Physics | 1280 + 20 = 1300 | `hybrid_best.pt` | The older "legacy" two-input model. |
-| `full_hybrid` | Deep + Physics + PRNU + Semantic | 1280 + 20 + 9 + 384 = **1693** (concat/gated) or 512 (attention) | `full_hybrid_best.pt` | The main, current model. Trained by the Run 2 notebooks. |
+| `stage1` | Deep only | 1280 | `stage1_best.pt` | Image-only baseline. (Training works — see the correction in section 11.) |
+| `hybrid` | Deep + Physics | 1280 + 22 = 1302 | `hybrid_best.pt` | The older "legacy" two-input model (fusion fixed to concat). |
+| `full_hybrid` | Deep + Physics + PRNU + Semantic | 1280 + 22 + 9 + 384 = **1695** (concat/gated) or 512 (attention) | `full_hybrid_best.pt` | The main, current model. Trained by the Run 2 notebooks. |
+
+> Beyond these three main modes, three single-branch **ablation modes** — `physics_only`, `prnu_only`, `semantic_only` — train and run one expert in isolation (`BranchOnlyClassifier`) to measure its standalone contribution.
 
 ---
 
@@ -105,7 +303,7 @@ ai-vs-real-face-detector/
 │   ├── inference.py              Single-image prediction (the hub)
 │   ├── evaluate.py               Metrics, plots, data-leakage report, ablations
 │   ├── deep_branch/              EfficientNet + preprocessing + face alignment
-│   ├── physics_branch/           Eyes, reflections, light, shadows (20 features)
+│   ├── physics_branch/           Scene optics: light, spectrum, colour, texture (22 features)
 │   ├── prnu_branch/              Camera sensor-noise features (9 features)
 │   ├── semantic_branch/          ViT embeddings + attention maps (384 features)
 │   ├── fusion/                   Combine the branches (concat / gated / attention)
@@ -166,22 +364,28 @@ This branch is the "gut instinct" expert: a large image network that has learned
 
 ### 7.3 The Physics branch — `src/physics_branch/`
 
-This is the most distinctive expert: it checks whether the face obeys real-world optics. It runs as a small pipeline and outputs exactly **20 numbers**.
+This is the most distinctive expert. In the current code it is a **scene-level optics** analyzer: over the whole image it measures statistics that a real camera-plus-scene tends to produce and that generators often get subtly wrong — how light is distributed, the frequency spectrum, colour behaviour, and texture regularity. It runs as a small pipeline and outputs exactly **22 numbers** (`PHYSICS_FEATURE_DIM = 22`, defined in `scene_physics.py`). The older eye-optics checks (corneal reflections, iris/pupil shape, per-eye light direction) still exist but are now an **optional** side-channel: they run only when `include_face_cues=True` and contribute explainability *metadata*, not the 22 classifier features.
 
 ```mermaid
 flowchart LR
-    A["Face image"] --> B["region_detection: dlib 68 landmarks + eye crops"]
-    B --> C["corneal_reflection: eye catchlights + overlap"]
-    B --> D["iris_pupil: pupil shape + iris texture"]
-    C --> E["shadow_geometry: light direction + shadows"]
-    B --> F["fresnel: reflectance plausibility (notes only)"]
-    C --> G["feature_vector: assemble the 20 numbers"]
-    D --> G
-    E --> G
-    G --> H["normalization: rescale to a standard range"]
+    A["Portrait / scene image"] --> S["scene_physics.extract_scene_physics"]
+    S --> S1["Illumination: uniformity, gradient, L-R & T-B brightness"]
+    S --> S2["Shadows & highlights: coverage, spatial entropy, specular clusters"]
+    S --> S3["Frequency: radial spectrum slope, high-freq ratio, JPEG blockiness"]
+    S --> S4["Colour: chromaticity, R-G correlation, colour constancy, Lab chroma"]
+    S --> S5["Texture: edge density, orientation entropy, defocus, symmetry"]
+    S1 --> V["22-feature vector"]
+    S2 --> V
+    S3 --> V
+    S4 --> V
+    S5 --> V
+    V --> N["normalization: z-score to a standard range"]
+    A -. "optional: include_face_cues" .-> EYE["Eye optics: corneal / iris / shadow / fresnel -> metadata only"]
 ```
 
-**`region_detection.py`** — The foundation of the branch (~800 lines). It uses **dlib's** HOG face detector plus the classic **68-point facial-landmark model** (`shape_predictor_68_face_landmarks.dat`, auto-downloaded on first use to a local cache). From the landmarks it isolates each eye and produces a `FaceLandmarks` object. If no face is found it returns a result marked `detected = False`, and the rest of the branch degrades gracefully. Important caveat: the 68-point model has no iris/pupil points, so the code **approximates** them as a small circle around each eye's center — everything "iris/pupil" downstream rests on that approximation. (This file replaced an older MediaPipe detector that caused a threading deadlock during training.)
+The remaining files in this folder implement the **optional eye-optics face-cue path**, used only when `include_face_cues=True`; the default 22-feature vector comes entirely from `scene_physics.py`.
+
+**`region_detection.py`** — The foundation of the eye-optics path (~800 lines). It uses **dlib's** HOG face detector plus the classic **68-point facial-landmark model** (`shape_predictor_68_face_landmarks.dat`, auto-downloaded on first use to a local cache). From the landmarks it isolates each eye and produces a `FaceLandmarks` object. If no face is found it returns a result marked `detected = False`, and the rest of the branch degrades gracefully. Important caveat: the 68-point model has no iris/pupil points, so the code **approximates** them as a small circle around each eye's center — everything "iris/pupil" downstream rests on that approximation. (This file replaced an older MediaPipe detector that caused a threading deadlock during training.)
 
 **`corneal_reflection.py`** — Finds the bright pinpoint reflection (the "catchlight") in each eye. In a real photo, both eyes are lit by the same environment, so the two catchlights should match. It detects each highlight, mirrors the right eye onto the left, and measures the overlap (IoU). Low overlap is suspicious.
 
@@ -189,34 +393,36 @@ flowchart LR
 
 **`shadow_geometry.py`** — Estimates the direction light is coming from (using each eye's catchlight) and analyzes shadows across the face. If the two eyes imply light from different directions, or the face's shadows are lopsided, that's a red flag. It outputs an angle difference, a similarity score, and a consistency flag.
 
-**`fresnel.py`** — Computes the physics of how much light a real cornea should reflect at a given angle (the Fresnel equations, using a cornea refractive index of 1.376). This is used **only as explainability metadata** — it is deliberately **not** one of the 20 classifier features — so it can describe plausibility without the model leaning on a heuristic.
+**`fresnel.py`** — Computes the physics of how much light a real cornea should reflect at a given angle (the Fresnel equations, using a cornea refractive index of 1.376). Like the other eye-optics modules it belongs to the **optional face-cue path** and is used **only as explainability metadata** — it is deliberately **not** one of the 22 classifier features — so it can describe plausibility without the model leaning on a heuristic.
 
-**`feature_vector.py`** — The assembler. It runs the sub-analyses above and packs the results into the fixed, ordered **20-feature vector** (`PHYSICS_FEATURE_DIM = 20`). The 20 features are:
+**`feature_vector.py`** — The assembler and public API of the branch. `PhysicsFeatureExtractor.extract(image)` calls `extract_scene_physics(image)` (in `scene_physics.py`) and returns a `PhysicsFeatureVector` whose `.vector` is the fixed, ordered **22-feature** array (`PHYSICS_FEATURE_DIM = 22`). When constructed with `include_face_cues=True` and a face is detected, the eye-optics results above are attached as metadata only — they are not part of the 22 classifier features. The 22 features (descriptive readings; exact formulas live in `scene_physics.py`) are:
 
 | # | Feature | Plain meaning |
 |---|---|---|
-| 0 | `face_detected` | Was a face found at all (1/0) |
-| 1 | `highlight_iou` | Overlap of the two eye catchlights |
-| 2 | `highlight_consistent` | Is that overlap good enough (1/0) |
-| 3 | `highlight_offset_x` | Horizontal mismatch of the catchlights |
-| 4 | `highlight_offset_y` | Vertical mismatch of the catchlights |
-| 5 | `left_pupil_eccentricity` | How stretched the left pupil is |
-| 6 | `right_pupil_eccentricity` | How stretched the right pupil is |
-| 7 | `pupil_eccentricity_diff` | Difference in pupil shape between eyes |
-| 8 | `pupil_regularity_mean` | How round the pupils are on average |
-| 9 | `left_iris_entropy` | Left iris texture richness |
-| 10 | `right_iris_entropy` | Right iris texture richness |
-| 11 | `iris_entropy_mean` | Average iris texture richness |
-| 12 | `iris_entropy_diff` | Left/right iris texture mismatch |
-| 13 | `light_angle_diff_deg` | Disagreement between the eyes on light direction |
-| 14 | `light_cosine_similarity` | Agreement between the eyes' light vectors |
-| 15 | `light_consistent` | Is the lighting consistent (1/0) |
-| 16 | `left_highlight_detected` | Was a left catchlight found (1/0) |
-| 17 | `right_highlight_detected` | Was a right catchlight found (1/0) |
-| 18 | `left_pupil_detected` | Was a left pupil fit (1/0) |
-| 19 | `right_pupil_detected` | Was a right pupil fit (1/0) |
+| 0 | `illumination_uniformity` | How evenly the whole image is lit |
+| 1 | `illumination_gradient_magnitude` | Strength of the overall brightness gradient |
+| 2 | `left_right_brightness_diff` | Brightness imbalance between the left and right halves |
+| 3 | `top_bottom_brightness_diff` | Brightness imbalance between the top and bottom halves |
+| 4 | `shadow_coverage` | Fraction of the image sitting in shadow |
+| 5 | `highlight_coverage` | Fraction of the image in bright highlights |
+| 6 | `highlight_spatial_entropy` | How scattered (vs clustered) the highlights are |
+| 7 | `specular_cluster_count` | Number of distinct specular (shiny) spots |
+| 8 | `chromaticity_std` | Spread of chromaticity (colour) across the image |
+| 9 | `rg_channel_correlation` | Correlation between the red and green channels |
+| 10 | `radial_spectrum_slope` | Slope of the radial frequency spectrum (texture falloff) |
+| 11 | `high_freq_energy_ratio` | Share of energy in high frequencies (fine detail) |
+| 12 | `jpeg_blockiness` | Strength of 8×8 JPEG block artifacts |
+| 13 | `edge_density` | How much of the image is edges |
+| 14 | `gradient_orientation_entropy` | How varied the edge directions are |
+| 15 | `defocus_variance` | Variance of focus/sharpness (blur cues) |
+| 16 | `noise_residual_std` | Std-dev of the image's noise residual |
+| 17 | `color_constancy_error` | Deviation from expected white-balance / colour constancy |
+| 18 | `horizontal_symmetry` | Left–right mirror symmetry of the image |
+| 19 | `lab_chroma_std` | Spread of chroma in CIELAB colour space |
+| 20 | `chromatic_edge_mismatch` | Colour-fringing mismatch at edges |
+| 21 | `block_texture_regularity` | How regular/repetitive the block texture is |
 
-**`normalization.py`** — Rescales each of the 20 features to a standard range (z-scoring: subtract the mean, divide by the standard deviation) so no single feature dominates. `PhysicsNormalizer` ships with sensible default statistics but is normally **fitted on the training data** and saved inside the checkpoint. It has no file of its own — it saves/loads itself as a plain dictionary via `to_dict()` / `from_dict()`.
+**`normalization.py`** — Rescales each of the 22 features to a standard range (z-scoring: subtract the mean, divide by the standard deviation) so no single feature dominates. `PhysicsNormalizer` ships with sensible default statistics but is normally **fitted on the training data** and saved inside the checkpoint. It has no file of its own — it saves/loads itself as a plain dictionary via `to_dict()` / `from_dict()`. (The PRNU branch reuses this same `PhysicsNormalizer` class for its 9 features.)
 
 ### 7.4 The PRNU branch — `src/prnu_branch/`
 
@@ -235,7 +441,7 @@ flowchart TD
     subgraph CONCAT["concat (simplest)"]
         c1["Glue all vectors end to end. Width = sum of all branches."]
     end
-    subgraph GATED["gated (default)"]
+    subgraph GATED["gated (train.py default)"]
         g1["Learn one importance dial per branch, scale each branch by its dial, then glue together. Same total width."]
     end
     subgraph ATTENTION["attention"]
@@ -243,7 +449,7 @@ flowchart TD
     end
 ```
 
-`concatenate_features(...)` handles the plain gluing; `FeatureFusion` wraps all three modes and can also report how much weight each branch received (`get_fusion_weights`). For `full_hybrid`, concat and gated both produce a width of **1693**; attention produces **512** (128 × 4 branches). The default is **gated**.
+`concatenate_features(...)` handles the plain gluing; `FeatureFusion` wraps all three modes and can also report how much weight each branch received (`get_fusion_weights`). For `full_hybrid`, concat and gated both produce a width of **1695**; attention produces **512** (128 × 4 branches). The class-level default is **concat** (`FeatureFusion`/`FullHybridClassifier`), but `train.py`'s `--fusion-mode` flag defaults to **gated**, so CLI-trained models are gated unless overridden.
 
 ### 7.7 Classifier — `src/classifier/`
 
@@ -319,7 +525,7 @@ flowchart TD
 
 ### 7.15 The dashboard — `dashboard/index.html`
 
-A single self-contained web page ("tringtring Forensics") with a dark theme and no build step. You drag-and-drop or select a portrait, it POSTs the file to `/api/v1/predict`, then shows the verdict badge, the confidence and real/AI split, the original image next to the Grad-CAM heatmap, and three "evidence cards" summarizing the physics checks (corneal reflection, pupil/iris shape, light direction). It only uses the `/predict` endpoint and only reads a handful of fields from the response.
+A single self-contained web page ("tringtring Forensics") with a dark theme and no build step. You drag-and-drop or select a portrait, it POSTs the file to `/api/v1/predict`, then shows the verdict badge, the confidence and real/AI split, and the original image next to the Grad-CAM heatmap. Below that it renders three physics **evidence cards** — **Illumination**, **Sampling & Compression**, and **Color & Texture** — populated from the `physics_features` block (e.g. `illumination_uniformity`, `block_texture_regularity`). It also shows a **Sensor Noise Analysis (PRNU)** section when `prnu` is present and a ViT-attention panel when `vit_attention` is present, so cards for branches that didn't run are hidden rather than shown empty. It uses only the `/predict` endpoint, reading `label`, `confidence_score`, `probability_distribution`, `heatmap`, `physics_features`, `prnu`, `vit_attention`, `fusion_weights`, and `features_used_in_classification` from the response.
 
 ### 7.16 Deployment — `docker/`
 
@@ -329,11 +535,11 @@ A single self-contained web page ("tringtring Forensics") with a dark theme and 
 
 ### 7.17 Tests — `tests/`
 
-Thirteen `pytest` files plus a `conftest.py` that puts the repo root on the import path. The suite covers the deterministic, CPU-friendly parts well: the physics branch (reflection detection, IoU, Fresnel, shadows, pupil fitting, the 20-feature vector), all three fusion modes, calibration and the REAL/AI/UNCERTAIN decision, PRNU features, preprocessing and face alignment, the explanation text, the API response schema, and the evaluator's metrics + leakage detection. The end-to-end inference tests **skip themselves** if no trained checkpoint or sample images are present, so a clean checkout runs the rest without needing a model. Lightly covered: the training loop itself, the raw network forward passes, Grad-CAM generation, and the live API server.
+Thirteen `pytest` files plus a `conftest.py` that puts the repo root on the import path. The suite covers the deterministic, CPU-friendly parts well: the physics branch (reflection detection, IoU, Fresnel, shadows, pupil fitting, the 22-feature vector), all three fusion modes, calibration and the REAL/AI/UNCERTAIN decision, PRNU features, preprocessing and face alignment, the explanation text, the API response schema, and the evaluator's metrics + leakage detection. The end-to-end inference tests **skip themselves** if no trained checkpoint or sample images are present, so a clean checkout runs the rest without needing a model. Lightly covered: the training loop itself, the raw network forward passes, Grad-CAM generation, and the live API server.
 
 | Test file | Focuses on |
 |---|---|
-| `test_physics_branch.py` | Reflection/IoU, highlight detection, pupil ellipse, 20-feature vector, no-face handling |
+| `test_physics_branch.py` | Reflection/IoU, highlight detection, pupil ellipse, 22-feature vector, no-face handling |
 | `test_fresnel.py` | Fresnel reflectance at normal vs grazing angles |
 | `test_fusion.py` / `test_fusion_extended.py` | Concatenation and the gated/attention output shapes |
 | `test_calibration.py` | Temperature scaling, uncertainty decision, calibration error |
@@ -394,10 +600,10 @@ The golden rule the code follows: the **model/feature core never imports the web
 | Branch | Feature count | Produced by |
 |---|---|---|
 | Deep (EfficientNet-B0) | 1280 | `deep_branch/feature_extractor.py` |
-| Physics | 20 | `physics_branch/feature_vector.py` |
+| Physics | 22 | `physics_branch/scene_physics.py` |
 | PRNU | 9 | `prnu_branch/extractor.py` |
 | Semantic (ViT-S/16) | 384 | `semantic_branch/encoder.py` |
-| **Full hybrid fused (concat/gated)** | **1693** | `fusion/fuse.py` |
+| **Full hybrid fused (concat/gated)** | **1695** | `fusion/fuse.py` |
 | Full hybrid fused (attention) | 512 | `fusion/fuse.py` |
 | Final output classes | 2 (real, AI) | `classifier/head.py` |
 
@@ -413,7 +619,7 @@ The system uses **multiple independent experts** rather than one network so that
 
 Several of these are noted in the README; the ones marked **confirmed in code** were verified while writing this document.
 
-- **`stage1` training is broken (confirmed in code).** In `train.py`, `run_stage1` calls `train_epoch_full_hybrid(...)` with missing required arguments (and that helper expects PRNU/semantic data a stage1 batch doesn't have). It will crash on the first epoch. The correct helper `train_epoch_stage1` exists but is never called. `hybrid` and `full_hybrid` training are fine.
+- **`stage1` training works (re-verified in code 2026-10-01).** An earlier draft reported that `run_stage1` called `train_epoch_full_hybrid(...)` with missing arguments; in the current source `run_stage1` correctly calls `train_epoch_stage1(...)` (`train.py:1474`), and `train_epoch_full_hybrid` is invoked only by `run_full_hybrid` with its full argument list. All of `stage1`, `hybrid`, and `full_hybrid` train.
 - **The evaluator's `--ablation` mode is broken (confirmed in code).** `run_ablation` calls `_dataset_for_evaluation(...)` with one too few arguments and raises an error. Normal (non-ablation) evaluation works.
 - **`evaluate.py` targets the legacy models.** It evaluates `stage1`/`hybrid` cleanly but was not fully updated for `full_hybrid` PRNU+semantic checkpoints; for those, rely on the held-out test evaluation that `train.py` runs automatically.
 - **PRNU is a weak signal without a reference camera** and always reports "limited" reliability. There is also a likely mislabeling in its high-frequency calculation (no FFT shift), so treat the PRNU numbers as soft hints.
