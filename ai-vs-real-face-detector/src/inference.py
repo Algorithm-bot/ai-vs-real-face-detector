@@ -149,7 +149,11 @@ def predict(
     align_face: bool = False,
 ) -> Dict[str, Any]:
     cfg = get_config()
-    device_t = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    device_t = torch.device(device or (
+        "mps" if torch.backends.mps.is_available()
+        else "cuda" if torch.cuda.is_available()
+        else "cpu"
+    ))
     model, mode = get_model(checkpoint_path, device_t)
 
     bgr = cv2.imread(image_path)

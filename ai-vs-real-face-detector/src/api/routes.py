@@ -46,7 +46,11 @@ def configure(checkpoint_path: str, db_session_factory) -> None:
         import torch
         _, _model_mode = get_model(
             checkpoint_path,
-            torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+            torch.device(
+                "mps" if torch.backends.mps.is_available()
+                else "cuda" if torch.cuda.is_available()
+                else "cpu"
+            ),
         )
 
 

@@ -73,36 +73,54 @@ def set_seed(seed: int = 42) -> None:
     np.random.seed(seed)
 
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
-    # Deterministic behavior where possible.
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+        # Deterministic behavior where possible.
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
 
 # ============================================================
 # GPU
 # ============================================================
 
-def require_gpu() -> torch.device:
-    """Require CUDA GPU for real training."""
+def require_gpu(allow_cpu: bool = False) -> torch.device:
+    """Select MPS or CUDA for training; permit CPU only for smoke tests."""
 
-    if not torch.cuda.is_available():
+    mps_backend = getattr(torch.backends, "mps", None)
+    if mps_backend is not None and mps_backend.is_available():
+        device = torch.device("mps")
+        print("=" * 60)
+        print("ACCELERATOR INFORMATION")
+        print("=" * 60)
+        print("Device:", device)
+        print("MPS available:", mps_backend.is_available())
+        print("MPS built:", mps_backend.is_built())
+        print("=" * 60)
+        return device
+
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+        print("=" * 60)
+        print("ACCELERATOR INFORMATION")
+        print("=" * 60)
+        print("Device:", device)
+        print("GPU:", torch.cuda.get_device_name(0))
+        print("CUDA:", torch.version.cuda)
+        print("=" * 60)
+        return device
+
+    if not allow_cpu:
         raise RuntimeError(
-            "CUDA GPU not available.\n"
-            "Run this script on Google Colab or Kaggle with GPU runtime enabled.\n"
-            "Do NOT train on an 8GB RAM laptop."
+            "No MPS or CUDA accelerator available.\n"
+            "Run this script on Apple Silicon, Google Colab, or Kaggle with an accelerator enabled.\n"
+            "Do NOT train on CPU without --allow-cpu."
         )
 
-    device = torch.device("cuda")
-
-    print("=" * 60)
-    print("GPU INFORMATION")
-    print("=" * 60)
-    print("GPU:", torch.cuda.get_device_name(0))
-    print("CUDA:", torch.version.cuda)
-    print("=" * 60)
-
+    device = torch.device("cpu")
+    print("WARNING: CPU mode enabled.")
+    print("This should ONLY be used for smoke tests.")
     return device
 
 
@@ -637,7 +655,7 @@ def _loader_extras(args, persistent: bool = False) -> dict:
     return extras
 
 
-def build_loaders(args):
+def build_loaders(args, device: torch.device):
 
     preprocessor = FacePreprocessor()
 
@@ -694,7 +712,7 @@ def build_loaders(args):
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
-        pin_memory=True,
+        pin_memory=(device.type == "cuda"),
         **_loader_extras(args, persistent=True),
     )
 
@@ -703,7 +721,7 @@ def build_loaders(args):
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
-        pin_memory=True,
+        pin_memory=(device.type == "cuda"),
         **_loader_extras(args),
     )
 
@@ -721,7 +739,7 @@ def build_loaders(args):
     )
     test_loader = DataLoader(
         test_ds, batch_size=args.batch_size, shuffle=False,
-        num_workers=args.num_workers, pin_memory=True,
+        num_workers=args.num_workers, pin_memory=(device.type == "cuda"),
         **_loader_extras(args),
     )
     return train_loader, val_loader, test_loader
@@ -1330,7 +1348,7 @@ def run_stage1(
     print("STAGE 1 — DEEP BRANCH TRAINING")
     print("=" * 60)
 
-    train_loader, val_loader, test_loader = build_loaders(args)
+    train_loader, val_loader, test_loader = build_loaders(args, device)
 
     print(
         f"\nTraining batches: {len(train_loader)}"
@@ -1554,7 +1572,7 @@ def run_hybrid(
     print("=" * 60)
 
     train_loader, val_loader = build_loaders(
-        args
+        args, device
     )
 
     print(
@@ -1789,7 +1807,7 @@ def run_full_hybrid(args, device) -> None:
     print("FULL HYBRID TRAINING — EFFICIENTNET + PHYSICS + PRNU + ViT")
     print("=" * 60)
 
-    train_loader, val_loader, test_loader = build_loaders(args)
+    train_loader, val_loader, test_loader = build_loaders(args, device)
 
     # ------------------------------------------------------------
     # Fit feature scalers ONLY on training images
@@ -2211,7 +2229,7 @@ def run_branch_only(args, device) -> None:
     print(f"SINGLE-BRANCH TRAINING — {mode.upper()}")
     print("=" * 60)
 
-    train_loader, val_loader, test_loader = build_loaders(args)
+    train_loader, val_loader, test_loader = build_loaders(args, device)
     physics_normalizer, prnu_normalizer = None, None
     if mode in {"physics_only", "prnu_only"}:
         from src.features.feature_scalers import fit_physics_and_prnu_scalers
@@ -2553,24 +2571,7 @@ def main() -> None:
     # Device
     # --------------------------------------------------------
 
-    if args.allow_cpu:
-
-        device = torch.device(
-            "cpu"
-        )
-
-        print(
-            "WARNING: CPU mode enabled."
-        )
-
-        print(
-            "This should ONLY be used "
-            "for smoke tests."
-        )
-
-    else:
-
-        device = require_gpu()
+    device = require_gpu(args.allow_cpu)
 
     # --------------------------------------------------------
     # Output directory

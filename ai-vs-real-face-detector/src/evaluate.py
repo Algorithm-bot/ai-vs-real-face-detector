@@ -187,7 +187,11 @@ def save_plots(labels: Sequence[int], scores: Sequence[float], output_dir: Path)
 
 def evaluate(checkpoint: Path, data_dir: Path, output_dir: Path, device_name: str | None = None) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
-    device = torch.device(device_name or ("cuda" if torch.cuda.is_available() else "cpu"))
+    device = torch.device(device_name or (
+        "mps" if torch.backends.mps.is_available()
+        else "cuda" if torch.cuda.is_available()
+        else "cpu"
+    ))
     raw_checkpoint = torch.load(checkpoint, map_location="cpu", weights_only=False)
     mode = raw_checkpoint.get("mode", "hybrid")
     try:
