@@ -13,6 +13,7 @@ import argparse
 import json
 import random
 import sys
+import time
 from collections import defaultdict
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Tuple
@@ -640,6 +641,8 @@ class StreamingFaceBinaryDataset(IterableDataset):
     """
 
     IMAGE_KEYS = ("jpg", "jpeg", "png", "webp")
+    STREAM_RETRY_ATTEMPTS = 5
+    STREAM_RETRY_INITIAL_BACKOFF_SECONDS = 2
 
     def __init__(
         self,
@@ -660,11 +663,8 @@ class StreamingFaceBinaryDataset(IterableDataset):
         if not repo_id:
             raise ValueError("--hf-dataset-repo is required with --data-source hf-stream.")
 
-        # Keep this import local so the established local-folder workflow can
-        # still import train.py before optional streaming dependencies install.
-        import datasets
-
         self.split = split
+        self.repo_id = repo_id
         self.seed = seed
         self.use_physics = use_physics
         self.use_prnu = use_prnu
@@ -673,13 +673,7 @@ class StreamingFaceBinaryDataset(IterableDataset):
         self.semantic_pretrained = semantic_pretrained
         self.preprocessor = preprocessor
         self.transform = transform
-        self._stream = datasets.load_dataset(
-            "webdataset",
-            data_files={split: f"hf://datasets/{repo_id}/{split}/{split}-*.tar"},
-            streaming=True,
-        )[split]
-        if split == "train":
-            self._stream = self._stream.shuffle(buffer_size=2000, seed=seed)
+        self._stream = self._build_stream()
 
         # Constructed by the worker that consumes the data, not in the parent
         # process. This is important for the ViT and for DataLoader workers.
@@ -687,6 +681,70 @@ class StreamingFaceBinaryDataset(IterableDataset):
         self.prnu_extractor = None
         self.semantic_extractor = None
         self._extractor_worker_id = None
+
+    def _build_stream(self):
+        """Create the deterministic source stream used for initial reads and retries."""
+        # Keep this import local so the established local-folder workflow can
+        # still import train.py before optional streaming dependencies install.
+        import datasets
+
+        stream = datasets.load_dataset(
+            "webdataset",
+            data_files={
+                self.split: (
+                    f"hf://datasets/{self.repo_id}/{self.split}/{self.split}-*.tar"
+                )
+            },
+            streaming=True,
+        )[self.split]
+        if self.split == "train":
+            stream = stream.shuffle(buffer_size=2000, seed=self.seed)
+        return stream
+
+    @staticmethod
+    def _stream_retryable_errors() -> Tuple[type[BaseException], ...]:
+        """Return network exceptions emitted by supported datasets streaming stacks."""
+        errors: List[type[BaseException]] = [ConnectionError, TimeoutError]
+
+        # Older datasets/huggingface_hub releases use requests + urllib3.
+        try:
+            from requests.exceptions import RequestException
+            from urllib3.exceptions import HTTPError as Urllib3HTTPError
+
+            errors.extend((RequestException, Urllib3HTTPError))
+        except ImportError:
+            pass
+
+        # Current datasets retries these transport exceptions internally when
+        # opening remote files, but they can still escape during iteration.
+        try:
+            import asyncio
+            import httpx
+
+            errors.extend((asyncio.TimeoutError, httpx.RequestError))
+        except ImportError:
+            pass
+        try:
+            from aiohttp.client_exceptions import ClientError
+
+            errors.append(ClientError)
+        except ImportError:
+            pass
+        try:
+            from fsspec.exceptions import FSTimeoutError
+
+            errors.append(FSTimeoutError)
+        except ImportError:
+            pass
+        return tuple(errors)
+
+    def _restart_stream_after_failure(self, yielded_samples: int):
+        """Recreate a failed iterable and advance it to the last yielded sample."""
+        stream = self._build_stream()
+        if yielded_samples:
+            stream = stream.skip(yielded_samples)
+        self._stream = stream
+        return iter(stream)
 
     def _ensure_extractors(self) -> None:
         from torch.utils.data import get_worker_info
@@ -742,7 +800,35 @@ class StreamingFaceBinaryDataset(IterableDataset):
 
     def iter_decoded_samples(self) -> Iterator[Tuple[np.ndarray, int, str]]:
         """Yield raw RGB samples for streaming-only preprocessing such as scaler fitting."""
-        for item in self._stream:
+        stream_iterator = iter(self._stream)
+        yielded_samples = 0
+        retry_attempt = 0
+        retryable_errors = self._stream_retryable_errors()
+
+        while True:
+            try:
+                item = next(stream_iterator)
+            except StopIteration:
+                return
+            except retryable_errors as exc:
+                retry_attempt += 1
+                if retry_attempt > self.STREAM_RETRY_ATTEMPTS:
+                    raise
+
+                delay = self.STREAM_RETRY_INITIAL_BACKOFF_SECONDS * (2 ** (retry_attempt - 1))
+                print(
+                    "WARNING: Hugging Face stream fetch failed "
+                    f"({type(exc).__name__}: {exc}). Retrying in {delay}s "
+                    f"[{retry_attempt}/{self.STREAM_RETRY_ATTEMPTS}]...",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                time.sleep(delay)
+                stream_iterator = self._restart_stream_after_failure(yielded_samples)
+                continue
+
+            retry_attempt = 0
+            yielded_samples += 1
             yield self._decode_sample(item)
 
     def __iter__(self) -> Iterator[dict]:
