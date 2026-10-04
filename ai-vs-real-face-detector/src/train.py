@@ -715,12 +715,19 @@ class StreamingFaceBinaryDataset(IterableDataset):
 
     @classmethod
     def _decode_sample(cls, item) -> Tuple[np.ndarray, int, str]:
-        img_bytes = next((item[key] for key in cls.IMAGE_KEYS if key in item), None)
-        if img_bytes is None:
+        img_value = next((item[key] for key in cls.IMAGE_KEYS if key in item), None)
+        if img_value is None:
             raise KeyError("WebDataset sample has no jpg/jpeg/png/webp image payload.")
-        bgr = cv2.imdecode(np.frombuffer(img_bytes, np.uint8), cv2.IMREAD_COLOR)
-        if bgr is None:
-            raise ValueError("Could not decode streamed WebDataset image.")
+
+        if isinstance(img_value, Image.Image):
+            # datasets' webdataset builder auto-decodes recognized image
+            # extensions (png/jpg/webp) into PIL Images rather than raw bytes.
+            rgb = np.array(img_value.convert("RGB"))
+        else:
+            bgr = cv2.imdecode(np.frombuffer(img_value, np.uint8), cv2.IMREAD_COLOR)
+            if bgr is None:
+                raise ValueError("Could not decode streamed WebDataset image.")
+            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
         metadata = item.get("json")
         if metadata is None:
@@ -731,7 +738,7 @@ class StreamingFaceBinaryDataset(IterableDataset):
             metadata = json.loads(metadata)
         if not isinstance(metadata, dict) or "label" not in metadata or "source" not in metadata:
             raise ValueError("WebDataset json metadata must contain label and source.")
-        return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB), int(metadata["label"]), str(metadata["source"])
+        return rgb, int(metadata["label"]), str(metadata["source"])
 
     def iter_decoded_samples(self) -> Iterator[Tuple[np.ndarray, int, str]]:
         """Yield raw RGB samples for streaming-only preprocessing such as scaler fitting."""
@@ -780,7 +787,15 @@ def _loader_extras(args, persistent: bool = False) -> dict:
 def _known_loader_batches(args, split: str) -> int:
     """Return a safe batch count for local or length-less streaming loaders."""
     if args.data_source == "hf-stream":
-        known_size = args.known_train_size if split == "train" else args.known_val_size
+        known_sizes = {
+            "train": args.known_train_size,
+            "val": args.known_val_size,
+            "test": args.known_test_size,
+        }
+        try:
+            known_size = known_sizes[split]
+        except KeyError as exc:
+            raise ValueError(f"Unknown streamed split: {split!r}") from exc
         return known_size // args.batch_size
     raise ValueError("Known batch counts are only needed for hf-stream loaders.")
 
@@ -2578,14 +2593,14 @@ def parse_args():
     parser.add_argument(
         "--hf-dataset-repo",
         type=str,
-        default="",
+        default="sahilSpit/ai-vs-real-face-detector-data",
         help="Public Hugging Face dataset repo with train/, val/, and test/ WebDataset shards.",
     )
 
     parser.add_argument(
         "--known-train-size",
         type=int,
-        default=722_869,
+        default=721_869,
         help="Known number of streamed training samples; used where IterableDataset has no length.",
     )
 
@@ -2594,6 +2609,13 @@ def parse_args():
         type=int,
         default=8_375,
         help="Known number of streamed validation samples; used where IterableDataset has no length.",
+    )
+
+    parser.add_argument(
+        "--known-test-size",
+        type=int,
+        default=90_704,
+        help="Known number of streamed test samples; used where IterableDataset has no length.",
     )
 
     parser.add_argument(
@@ -2763,9 +2785,11 @@ def main() -> None:
     if args.data_source == "hf-stream" and not args.hf_dataset_repo:
         raise ValueError("--hf-dataset-repo is required with --data-source hf-stream.")
     if args.data_source == "hf-stream" and (
-        args.known_train_size < args.batch_size or args.known_val_size < args.batch_size
+        args.known_train_size < args.batch_size
+        or args.known_val_size < args.batch_size
+        or args.known_test_size < args.batch_size
     ):
-        raise ValueError("Known streamed train/val sizes must each be at least one batch.")
+        raise ValueError("Known streamed train/val/test sizes must each be at least one batch.")
 
     set_seed(
         args.seed
