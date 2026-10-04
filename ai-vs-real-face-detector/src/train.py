@@ -701,6 +701,10 @@ class StreamingFaceBinaryDataset(IterableDataset):
             stream = stream.shuffle(buffer_size=2000, seed=self.seed)
         return stream
 
+    def reset_stream(self) -> None:
+        """Restart the deterministic source stream after a pre-training pass."""
+        self._stream = self._build_stream()
+
     @staticmethod
     def _stream_retryable_errors() -> Tuple[type[BaseException], ...]:
         """Return network exceptions emitted by supported datasets streaming stacks."""
@@ -892,10 +896,14 @@ def _loader_batches(loader, args, split: str) -> int:
 
 def fit_streaming_feature_scalers(
     dataset: StreamingFaceBinaryDataset,
-    max_samples: int = 300,
+    max_samples: int = 20_000,
+    total_samples: Optional[int] = None,
 ) -> Tuple[PhysicsNormalizer, PhysicsNormalizer]:
     """Fit full-hybrid scalers without requiring local image paths."""
     from src.prnu_branch.extractor import PRNU_FEATURE_NAMES
+
+    if max_samples < 0:
+        raise ValueError("max_samples must be >= 0 (0 means all training images).")
 
     physics_extractor = PhysicsFeatureExtractor()
     prnu_extractor = PRNUExtractor()
@@ -904,15 +912,21 @@ def fit_streaming_feature_scalers(
     try:
         for rgb, _, _ in tqdm(
             dataset.iter_decoded_samples(),
-            total=max_samples,
-            desc="Fitting streamed feature scalers",
+            total=max_samples if max_samples else total_samples,
+            desc="Fitting streamed physics/PRNU scalers",
+            unit="image",
+            dynamic_ncols=True,
         ):
             physics_vectors.append(physics_extractor.extract(rgb).vector)
             prnu_vectors.append(prnu_extractor.extract(rgb).vector)
-            if len(physics_vectors) >= max_samples:
+            if max_samples and len(physics_vectors) >= max_samples:
                 break
     finally:
         physics_extractor.close()
+        # Scaler fitting is a pre-training pass. Reset the iterable so the
+        # training DataLoader starts from the first deterministic sample and
+        # therefore still sees the complete training split.
+        dataset.reset_stream()
     if not physics_vectors:
         raise RuntimeError("No streamed training samples were available to fit feature scalers.")
     return (
@@ -2076,28 +2090,67 @@ def run_full_hybrid(args, device) -> None:
     print("FULL HYBRID TRAINING — EFFICIENTNET + PHYSICS + PRNU + ViT")
     print("=" * 60)
 
+    print("[1/5] Building datasets")
     train_loader, val_loader, test_loader = build_loaders(args, device)
 
     # ------------------------------------------------------------
     # Fit feature scalers ONLY on training images
     # ------------------------------------------------------------
-    from src.features.feature_scalers import fit_physics_and_prnu_scalers
+    from src.features.feature_scalers import (
+        fit_physics_and_prnu_scalers,
+        load_physics_and_prnu_scaler_cache,
+        save_physics_and_prnu_scaler_cache,
+    )
 
-    if args.data_source == "hf-stream":
-        physics_normalizer, prnu_normalizer = fit_streaming_feature_scalers(
-            train_loader.dataset
+    print("[2/5] Preparing physics/PRNU scalers")
+    scaler_cache_path = Path(args.output_dir) / "physics_prnu_scalers.pkl"
+    scaler_started_at = time.perf_counter()
+    cached_scalers = None
+    if not args.fresh and scaler_cache_path.exists():
+        print("Loading cached physics/PRNU scalers...")
+        cached_scalers = load_physics_and_prnu_scaler_cache(
+            scaler_cache_path,
+            args.scaler_samples,
+            args.seed,
         )
+
+    if cached_scalers is not None:
+        physics_normalizer, prnu_normalizer = cached_scalers
+        print(f"Scalers loaded in {time.perf_counter() - scaler_started_at:.1f} seconds")
     else:
-        train_paths = [
-            path for path, _, _ in train_loader.dataset.samples
-        ]
-        physics_normalizer, prnu_normalizer = (
-            fit_physics_and_prnu_scalers(train_paths)
+        if scaler_cache_path.exists() and not args.fresh:
+            print("Scaler cache is incompatible or unreadable; refitting scalers.")
+        elif args.fresh:
+            print("--fresh set: ignoring cached physics/PRNU scalers.")
+
+        if args.data_source == "hf-stream":
+            physics_normalizer, prnu_normalizer = fit_streaming_feature_scalers(
+                train_loader.dataset,
+                max_samples=args.scaler_samples,
+                total_samples=args.known_train_size,
+            )
+        else:
+            # Path strings are inexpensive; images are decoded one at a time
+            # in the fitter, and the DataLoader still owns the full dataset.
+            train_paths = [path for path, _, _ in train_loader.dataset.samples]
+            physics_normalizer, prnu_normalizer = fit_physics_and_prnu_scalers(
+                train_paths,
+                max_samples=args.scaler_samples,
+                seed=args.seed,
+            )
+        save_physics_and_prnu_scaler_cache(
+            scaler_cache_path,
+            physics_normalizer,
+            prnu_normalizer,
+            args.scaler_samples,
+            args.seed,
         )
+        print(f"Scalers fitted and cached in {time.perf_counter() - scaler_started_at:.1f} seconds")
 
     # ------------------------------------------------------------
     # Create model
     # ------------------------------------------------------------
+    print("[3/5] Creating model")
     model = FullHybridClassifier(
         model_name=args.backbone,
         semantic_model=args.semantic_model,
@@ -2138,6 +2191,7 @@ def run_full_hybrid(args, device) -> None:
     # full_hybrid_best.pt  -> best validation model for final testing
     # full_hybrid_resume.pt -> emergency mid-epoch recovery state
     # ------------------------------------------------------------
+    print("[4/5] Loading checkpoint")
     resume_checkpoint_path = Path(args.output_dir) / "full_hybrid_last.pt"
     best_checkpoint_path = Path(args.output_dir) / "full_hybrid_best.pt"
 
@@ -2211,6 +2265,8 @@ def run_full_hybrid(args, device) -> None:
     # ------------------------------------------------------------
     # TRAINING
     # ------------------------------------------------------------
+
+    print("[5/5] Starting training")
 
     if start_epoch > args.epochs:
 
@@ -2811,6 +2867,17 @@ def parse_args():
     )
 
     parser.add_argument(
+        "--scaler-samples",
+        type=int,
+        default=20_000,
+        help=(
+            "Number of training images used only to fit physics/PRNU scalers "
+            "for full_hybrid; 0 = all training images. Training still uses "
+            "the complete dataset."
+        ),
+    )
+
+    parser.add_argument(
         "--max-train-per-class",
         type=int,
         default=0,
@@ -2876,6 +2943,8 @@ def main() -> None:
         or args.known_test_size < args.batch_size
     ):
         raise ValueError("Known streamed train/val/test sizes must each be at least one batch.")
+    if args.scaler_samples < 0:
+        raise ValueError("--scaler-samples must be >= 0 (0 means all training images).")
 
     set_seed(
         args.seed
@@ -2926,6 +2995,7 @@ def main() -> None:
     print("Workers:", args.num_workers)
     print("Checkpoint interval:", args.checkpoint_interval, "batches")
     print("Seed:", args.seed)
+    print("Scaler samples:", args.scaler_samples, "(0 = all training images)")
     print("Fresh start (ignore existing checkpoint):", args.fresh)
 
     print("=" * 60)
