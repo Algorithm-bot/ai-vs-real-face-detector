@@ -160,16 +160,43 @@ def _label_from_dirname(name: str) -> Optional[int]:
     return None
 
 
+def _has_explicit_split_layout(root: Path) -> bool:
+    """True when data/{train,val,test}/{real,fake} exist as direct directories."""
+    return all(
+        (root / split / label).is_dir()
+        for split in ("train", "val", "test")
+        for label in ("real", "fake")
+    )
+
+
+def _has_explicit_label_dirs(split_root: Path) -> bool:
+    """True for the normal split_root/{real,fake} layout (no recursion)."""
+    return (split_root / "real").is_dir() and (split_root / "fake").is_dir()
+
+
+def _split_has_direct_label_dirs(folder: Path) -> bool:
+    return any(
+        (folder / name).is_dir()
+        for name in (*CNN_REAL_DIRNAMES, *CNN_FAKE_DIRNAMES)
+    )
+
+
+def _split_has_nested_cnndetection_labels(folder: Path) -> bool:
+    """Walk once looking for 0_real/1_fake (or real/fake) anywhere under folder."""
+    for _current_root, dirs, _files in os.walk(folder, followlinks=False):
+        for name in dirs:
+            if name in CNN_REAL_DIRNAMES or name in CNN_FAKE_DIRNAMES:
+                return True
+    return False
+
+
 def _split_has_labels(root: Path, split: str) -> bool:
     folder = root / split
     if not folder.is_dir():
         return False
-    if any((folder / name).is_dir() for name in (*CNN_REAL_DIRNAMES, *CNN_FAKE_DIRNAMES)):
+    if _split_has_direct_label_dirs(folder):
         return True
-    for dirname in (*CNN_REAL_DIRNAMES, *CNN_FAKE_DIRNAMES):
-        for _ in folder.rglob(dirname):
-            return True
-    return False
+    return _split_has_nested_cnndetection_labels(folder)
 
 
 def _source_from_relative(relative: Path, default: str) -> str:
@@ -179,6 +206,89 @@ def _source_from_relative(relative: Path, default: str) -> str:
     return "/".join(parts)
 
 
+def _posix_relpath(path: str, start: str) -> str:
+    rel = os.path.relpath(path, start)
+    if rel in (".", os.curdir):
+        return ""
+    return rel.replace("\\", "/")
+
+
+def _collect_under_label_root(
+    folder: Path,
+    label: int,
+    default: str,
+    samples: List[Tuple[str, int, str]],
+    seen: set,
+) -> None:
+    """Recursively collect images from one real/ or fake/ root only."""
+    folder_str = str(folder)
+    for current_root, dirs, files in os.walk(folder_str, followlinks=False):
+        dirs.sort()
+        files.sort()
+        rel_parent = _posix_relpath(current_root, folder_str)
+        source = rel_parent or default
+        for filename in files:
+            suffix = os.path.splitext(filename)[1].lower()
+            if suffix not in IMAGE_EXTENSIONS:
+                continue
+            path = os.path.join(current_root, filename)
+            if path in seen:
+                continue
+            seen.add(path)
+            samples.append((path, label, source))
+
+
+def _collect_cnndetection_images(split_root: Path) -> List[Tuple[str, int, str]]:
+    """Single-walk collection for nested 0_real/1_fake (CNNDetection) trees."""
+    samples: List[Tuple[str, int, str]] = []
+    seen = set()
+    split_root_str = str(split_root)
+
+    for current_root, dirs, files in os.walk(split_root_str, followlinks=False):
+        dirs.sort()
+        files.sort()
+        rel = _posix_relpath(current_root, split_root_str)
+        parts = Path(rel).parts if rel else ()
+        label_index = None
+        label = None
+        for i, part in enumerate(parts):
+            part_label = _label_from_dirname(part)
+            if part_label is not None:
+                label_index = i
+                label = part_label
+                break
+        if label is None:
+            root_label = _label_from_dirname(split_root.name)
+            if root_label is not None and not rel:
+                label = root_label
+                label_index = -1
+            else:
+                continue
+
+        default = "lsun" if label == 0 else "synthetic"
+        if label_index == -1:
+            source_from_parent = default
+            nested_after_label = rel
+        else:
+            parent_rel = "/".join(parts[:label_index])
+            source_from_parent = _source_from_relative(
+                Path(parent_rel) if parent_rel else Path(), default
+            )
+            nested_after_label = "/".join(parts[label_index + 1 :])
+        item_source = nested_after_label or source_from_parent or default
+
+        for filename in files:
+            suffix = os.path.splitext(filename)[1].lower()
+            if suffix not in IMAGE_EXTENSIONS:
+                continue
+            path = os.path.join(current_root, filename)
+            if path in seen:
+                continue
+            seen.add(path)
+            samples.append((path, label, item_source))
+    return samples
+
+
 def collect_labeled_images(split_root: Path) -> List[Tuple[str, int, str]]:
     """Collect (path, label, source) from real/fake or CNNDetection 0_real/1_fake trees."""
     samples: List[Tuple[str, int, str]] = []
@@ -186,29 +296,12 @@ def collect_labeled_images(split_root: Path) -> List[Tuple[str, int, str]]:
     if not split_root.is_dir():
         return samples
 
-    for folder in [split_root, *split_root.rglob("*")]:
-        if not folder.is_dir():
-            continue
-        label = _label_from_dirname(folder.name)
-        if label is None:
-            continue
-        rel_parent = folder.parent.relative_to(split_root) if folder.parent != split_root else Path()
-        default = "lsun" if label == 0 else "synthetic"
-        source = _source_from_relative(rel_parent, default)
-        for path in sorted(folder.rglob("*")):
-            if not _is_image_file(path):
-                continue
-            key = str(path.resolve())
-            if key in seen:
-                continue
-            seen.add(key)
-            nested = path.relative_to(folder)
-            if len(nested.parts) > 1:
-                item_source = "/".join(nested.parts[:-1])
-            else:
-                item_source = source
-            samples.append((str(path), label, item_source or default))
-    return samples
+    if _has_explicit_label_dirs(split_root):
+        _collect_under_label_root(split_root / "real", 0, "lsun", samples, seen)
+        _collect_under_label_root(split_root / "fake", 1, "synthetic", samples, seen)
+        return samples
+
+    return _collect_cnndetection_images(split_root)
 
 
 def process_face_sample(
@@ -339,10 +432,14 @@ class FaceBinaryDataset(Dataset):
         self.transform = transform
         self._cache_row = None
         self._cache_arrays = None
-        self.explicit_split_layout = all(
-            _split_has_labels(self.root, split_name)
-            for split_name in ("train", "val", "test")
-        )
+        # Six direct directory checks only. Nested CNNDetection discovery is
+        # used later, and only when this explicit layout is absent.
+        self.explicit_split_layout = _has_explicit_split_layout(self.root)
+        if not self.explicit_split_layout:
+            self.explicit_split_layout = all(
+                _split_has_labels(self.root, split_name)
+                for split_name in ("train", "val", "test")
+            )
         if split == "test" and not self.explicit_split_layout:
             raise FileNotFoundError(
                 "Held-out testing requires data/{train,val,test} with real/fake "
@@ -941,6 +1038,7 @@ def build_loaders(args, device: torch.device):
 
     preprocessor = FacePreprocessor()
     streaming = args.data_source == "hf-stream"
+    dataset_discovery_seconds = 0.0
 
     def make_dataset(split: str, transform):
         common = dict(
@@ -967,11 +1065,20 @@ def build_loaders(args, device: torch.device):
             **common,
         )
 
+    def make_timed_dataset(split: str, transform):
+        nonlocal dataset_discovery_seconds
+        started_at = time.perf_counter()
+        dataset = make_dataset(split, transform)
+        elapsed = time.perf_counter() - started_at
+        dataset_discovery_seconds += elapsed
+        print(f"[dataset] {split} discovery: {elapsed:.1f} sec")
+        return dataset
+
     # --------------------------------------------------------
     # Training dataset
     # --------------------------------------------------------
 
-    train_ds = make_dataset("train", get_train_transforms())
+    train_ds = make_timed_dataset("train", get_train_transforms())
 
     if not streaming and getattr(args, "max_train_per_class", 0) > 0:
         before = len(train_ds.samples)
@@ -987,7 +1094,7 @@ def build_loaders(args, device: torch.device):
     # Validation dataset
     # --------------------------------------------------------
 
-    val_ds = make_dataset("val", get_val_transforms())
+    val_ds = make_timed_dataset("val", get_val_transforms())
 
     # --------------------------------------------------------
     # DataLoaders
@@ -1012,9 +1119,11 @@ def build_loaders(args, device: torch.device):
     )
 
     if args.mode not in NEEDS_TEST_LOADER:
+        print(f"[dataset] total discovery: {dataset_discovery_seconds:.1f} sec")
         return train_loader, val_loader
 
-    test_ds = make_dataset("test", get_val_transforms())
+    test_ds = make_timed_dataset("test", get_val_transforms())
+    print(f"[dataset] total discovery: {dataset_discovery_seconds:.1f} sec")
     test_loader = DataLoader(
         test_ds, batch_size=args.batch_size, shuffle=False,
         num_workers=args.num_workers, pin_memory=(device.type == "cuda"),

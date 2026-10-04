@@ -34,7 +34,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src.inference import load_model
 from src.deep_branch.preprocessing import get_val_transforms
-from src.train import FaceBinaryDataset, _split_has_labels
+from src.train import FaceBinaryDataset, _has_explicit_split_layout, _split_has_labels
 from src.calibration.calibrator import UncertaintyEstimator
 from src.classifier.ablation import ABLATION_CONFIGS
 
@@ -110,7 +110,9 @@ def _dataset_for_evaluation(
         "transform": get_val_transforms(),
     }
     seed = int(checkpoint_args.get("seed", 42))
-    if all(_split_has_labels(data_dir, split) for split in ("train", "val", "test")):
+    if _has_explicit_split_layout(data_dir) or all(
+        _split_has_labels(data_dir, split) for split in ("train", "val", "test")
+    ):
         ds = FaceBinaryDataset(
             str(data_dir),
             split="test",
