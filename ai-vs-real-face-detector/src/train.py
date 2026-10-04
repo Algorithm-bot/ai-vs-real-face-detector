@@ -15,14 +15,14 @@ import random
 import sys
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterator, List, Optional, Tuple
 
 import numpy as np
 import torch
 torch.set_num_threads(1)
 import torch.nn as nn
 from PIL import Image
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, IterableDataset
 from sklearn.metrics import accuracy_score, confusion_matrix, precision_recall_fscore_support, roc_auc_score
 
 
@@ -208,6 +208,72 @@ def collect_labeled_images(split_root: Path) -> List[Tuple[str, int, str]]:
                 item_source = source
             samples.append((str(path), label, item_source or default))
     return samples
+
+
+def process_face_sample(
+    rgb: np.ndarray,
+    label: int,
+    source: str,
+    preprocessor: FacePreprocessor,
+    transform,
+    physics_extractor,
+    prnu_extractor,
+    semantic_extractor,
+    use_physics: bool,
+    use_prnu: bool,
+    use_semantic: bool,
+    cached: Optional[Dict[str, np.ndarray]] = None,
+) -> dict:
+    """Build model inputs from one decoded RGB image.
+
+    ``cached`` contains path-independent precomputed feature vectors when a
+    local feature cache is attached.  This deliberately has no path argument
+    so the same processing is usable by streamed WebDataset samples.
+    """
+    if use_physics:
+        if cached is not None:
+            physics_vec = cached["physics"]
+        else:
+            if physics_extractor is None:
+                raise RuntimeError("Physics extractor is unavailable.")
+            physics_vec = physics_extractor.extract(rgb).vector
+    else:
+        physics_vec = np.zeros(PHYSICS_FEATURE_DIM, dtype=np.float32)
+
+    if use_prnu:
+        if cached is not None:
+            prnu_vec = cached["prnu"]
+        else:
+            if prnu_extractor is None:
+                raise RuntimeError("PRNU extractor is unavailable for full_hybrid.")
+            prnu_vec = prnu_extractor.extract(rgb).vector
+    else:
+        prnu_vec = None
+
+    if use_semantic:
+        if cached is not None:
+            semantic_vec = cached["semantic"]
+        else:
+            if semantic_extractor is None:
+                raise RuntimeError("Semantic extractor is unavailable for full_hybrid.")
+            semantic_vec = semantic_extractor.extract(
+                rgb, return_attention=False
+            ).features
+    else:
+        semantic_vec = None
+
+    pil = preprocessor.preprocess_pil(Image.fromarray(rgb))
+    sample = {
+        "image": transform(pil),
+        "label": torch.tensor(label, dtype=torch.long),
+        "physics": torch.from_numpy(np.asarray(physics_vec, dtype=np.float32)),
+        "source": source,
+    }
+    if prnu_vec is not None:
+        sample["prnu"] = torch.from_numpy(np.asarray(prnu_vec, dtype=np.float32))
+    if semantic_vec is not None:
+        sample["semantic"] = torch.from_numpy(np.asarray(semantic_vec, dtype=np.float32))
+    return sample
 
 
 class FaceBinaryDataset(Dataset):
@@ -538,92 +604,148 @@ class FaceBinaryDataset(Dataset):
             cv2.COLOR_BGR2RGB,
         )
 
-        # ----------------------------------------------------
-        # Physics branch
-        # ----------------------------------------------------
-
-        if self.use_physics and self._cache_row is not None:
-            physics_vec = self._cache_arrays["physics"][self._cache_row[path]]
-
-        elif self.use_physics:
-
-            physics_result = (
-                self.physics_extractor.extract(rgb)
-            )
-
-            physics_vec = physics_result.vector
-
-        else:
-
-            physics_vec = np.zeros(
-                PHYSICS_FEATURE_DIM,
-                dtype=np.float32,
-            )
-
-        if self.use_prnu and self._cache_row is not None:
-            prnu_vec = self._cache_arrays["prnu"][self._cache_row[path]]
-        elif self.use_prnu:
-            if self.prnu_extractor is None:
-                raise RuntimeError("PRNU extractor is unavailable for full_hybrid.")
-            prnu_vec = self.prnu_extractor.extract(rgb).vector
-        else:
-            prnu_vec = None
-
-        if self.use_semantic and self._cache_row is not None:
-            semantic_vec = self._cache_arrays["semantic"][self._cache_row[path]]
-        elif self.use_semantic:
+        cached = None
+        if self._cache_row is not None:
+            row = self._cache_row[path]
+            cached = {
+                "physics": self._cache_arrays["physics"][row],
+                "prnu": self._cache_arrays["prnu"][row],
+                "semantic": self._cache_arrays["semantic"][row],
+            }
+        if self.use_semantic and cached is None and self.semantic_extractor is None:
             # Lazy construction avoids loading a ViT in stage1/hybrid modes
             # and ensures each DataLoader worker owns its encoder safely.
-            if self.semantic_extractor is None:
-                self.semantic_extractor = SemanticEncoder(
-                    model_name=self.semantic_model,
-                    pretrained=self.semantic_pretrained,
-                    device=torch.device("cpu"),
-                )
-            semantic_vec = self.semantic_extractor.extract(
-                rgb, return_attention=False
-            ).features
-        else:
-            semantic_vec = None
-
-        # ----------------------------------------------------
-        # Deep-learning preprocessing
-        # ----------------------------------------------------
-
-        pil = self.preprocessor.preprocess_pil(
-            Image.fromarray(rgb)
+            self.semantic_extractor = SemanticEncoder(
+                model_name=self.semantic_model,
+                pretrained=self.semantic_pretrained,
+                device=torch.device("cpu"),
+            )
+        sample = process_face_sample(
+            rgb, label, source, self.preprocessor, self.transform,
+            self.physics_extractor, self.prnu_extractor, self.semantic_extractor,
+            self.use_physics, self.use_prnu, self.use_semantic, cached=cached,
         )
-
-        tensor = self.transform(pil)
-
-        # ----------------------------------------------------
-        # Return sample
-        # ----------------------------------------------------
-
-        sample = {
-            "image": tensor,
-
-            "label": torch.tensor(
-                label,
-                dtype=torch.long,
-            ),
-
-            "physics": torch.from_numpy(
-                np.asarray(
-                    physics_vec,
-                    dtype=np.float32,
-                )
-            ),
-
-            "path": path,
-
-            "source": source,
-        }
-        if prnu_vec is not None:
-            sample["prnu"] = torch.from_numpy(np.asarray(prnu_vec, dtype=np.float32))
-        if semantic_vec is not None:
-            sample["semantic"] = torch.from_numpy(np.asarray(semantic_vec, dtype=np.float32))
+        # The shared processor intentionally has no path knowledge; preserve
+        # the local dataset's established output contract here.
+        sample["path"] = path
         return sample
+
+
+class StreamingFaceBinaryDataset(IterableDataset):
+    """Stream labeled WebDataset shards from the Hugging Face Hub.
+
+    Feature caching is deliberately not supported here: cache entries are
+    currently indexed by local path, while WebDataset samples have no stable
+    local filename.
+    """
+
+    IMAGE_KEYS = ("jpg", "jpeg", "png", "webp")
+
+    def __init__(
+        self,
+        repo_id: str,
+        split: str,
+        seed: int,
+        use_physics: bool,
+        use_prnu: bool,
+        use_semantic: bool,
+        semantic_model: str,
+        semantic_pretrained: bool,
+        preprocessor: FacePreprocessor,
+        transform,
+    ) -> None:
+        super().__init__()
+        if split not in {"train", "val", "test"}:
+            raise ValueError(f"Invalid split {split!r}; expected train, val, or test.")
+        if not repo_id:
+            raise ValueError("--hf-dataset-repo is required with --data-source hf-stream.")
+
+        # Keep this import local so the established local-folder workflow can
+        # still import train.py before optional streaming dependencies install.
+        import datasets
+
+        self.split = split
+        self.seed = seed
+        self.use_physics = use_physics
+        self.use_prnu = use_prnu
+        self.use_semantic = use_semantic
+        self.semantic_model = semantic_model
+        self.semantic_pretrained = semantic_pretrained
+        self.preprocessor = preprocessor
+        self.transform = transform
+        self._stream = datasets.load_dataset(
+            "webdataset",
+            data_files={split: f"hf://datasets/{repo_id}/{split}/{split}-*.tar"},
+            streaming=True,
+        )[split]
+        if split == "train":
+            self._stream = self._stream.shuffle(buffer_size=2000, seed=seed)
+
+        # Constructed by the worker that consumes the data, not in the parent
+        # process. This is important for the ViT and for DataLoader workers.
+        self.physics_extractor = None
+        self.prnu_extractor = None
+        self.semantic_extractor = None
+        self._extractor_worker_id = None
+
+    def _ensure_extractors(self) -> None:
+        from torch.utils.data import get_worker_info
+
+        worker = get_worker_info()
+        worker_id = worker.id if worker is not None else -1
+        if self._extractor_worker_id == worker_id:
+            return
+        if self.physics_extractor is not None:
+            try:
+                self.physics_extractor.close()
+            except Exception:
+                pass
+        self.physics_extractor = PhysicsFeatureExtractor() if self.use_physics else None
+        self.prnu_extractor = PRNUExtractor() if self.use_prnu else None
+        self.semantic_extractor = (
+            SemanticEncoder(
+                model_name=self.semantic_model,
+                pretrained=self.semantic_pretrained,
+                device=torch.device("cpu"),
+            )
+            if self.use_semantic
+            else None
+        )
+        self._extractor_worker_id = worker_id
+
+    @classmethod
+    def _decode_sample(cls, item) -> Tuple[np.ndarray, int, str]:
+        img_bytes = next((item[key] for key in cls.IMAGE_KEYS if key in item), None)
+        if img_bytes is None:
+            raise KeyError("WebDataset sample has no jpg/jpeg/png/webp image payload.")
+        bgr = cv2.imdecode(np.frombuffer(img_bytes, np.uint8), cv2.IMREAD_COLOR)
+        if bgr is None:
+            raise ValueError("Could not decode streamed WebDataset image.")
+
+        metadata = item.get("json")
+        if metadata is None:
+            raise KeyError("WebDataset sample has no json metadata payload.")
+        if isinstance(metadata, (bytes, bytearray)):
+            metadata = metadata.decode("utf-8")
+        if isinstance(metadata, str):
+            metadata = json.loads(metadata)
+        if not isinstance(metadata, dict) or "label" not in metadata or "source" not in metadata:
+            raise ValueError("WebDataset json metadata must contain label and source.")
+        return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB), int(metadata["label"]), str(metadata["source"])
+
+    def iter_decoded_samples(self) -> Iterator[Tuple[np.ndarray, int, str]]:
+        """Yield raw RGB samples for streaming-only preprocessing such as scaler fitting."""
+        for item in self._stream:
+            yield self._decode_sample(item)
+
+    def __iter__(self) -> Iterator[dict]:
+        self._ensure_extractors()
+        for rgb, label, source in self.iter_decoded_samples():
+            yield process_face_sample(
+                rgb, label, source, self.preprocessor, self.transform,
+                self.physics_extractor, self.prnu_extractor, self.semantic_extractor,
+                self.use_physics, self.use_prnu, self.use_semantic,
+            )
 
 
 # ============================================================
@@ -655,53 +777,102 @@ def _loader_extras(args, persistent: bool = False) -> dict:
     return extras
 
 
+def _known_loader_batches(args, split: str) -> int:
+    """Return a safe batch count for local or length-less streaming loaders."""
+    if args.data_source == "hf-stream":
+        known_size = args.known_train_size if split == "train" else args.known_val_size
+        return known_size // args.batch_size
+    raise ValueError("Known batch counts are only needed for hf-stream loaders.")
+
+
+def _loader_batches(loader, args, split: str) -> int:
+    return _known_loader_batches(args, split) if args.data_source == "hf-stream" else len(loader)
+
+
+def fit_streaming_feature_scalers(
+    dataset: StreamingFaceBinaryDataset,
+    max_samples: int = 300,
+) -> Tuple[PhysicsNormalizer, PhysicsNormalizer]:
+    """Fit full-hybrid scalers without requiring local image paths."""
+    from src.prnu_branch.extractor import PRNU_FEATURE_NAMES
+
+    physics_extractor = PhysicsFeatureExtractor()
+    prnu_extractor = PRNUExtractor()
+    physics_vectors = []
+    prnu_vectors = []
+    try:
+        for rgb, _, _ in tqdm(
+            dataset.iter_decoded_samples(),
+            total=max_samples,
+            desc="Fitting streamed feature scalers",
+        ):
+            physics_vectors.append(physics_extractor.extract(rgb).vector)
+            prnu_vectors.append(prnu_extractor.extract(rgb).vector)
+            if len(physics_vectors) >= max_samples:
+                break
+    finally:
+        physics_extractor.close()
+    if not physics_vectors:
+        raise RuntimeError("No streamed training samples were available to fit feature scalers.")
+    return (
+        PhysicsNormalizer.fit(np.stack(physics_vectors, axis=0)),
+        PhysicsNormalizer.fit(
+            np.stack(prnu_vectors, axis=0), feature_names=list(PRNU_FEATURE_NAMES)
+        ),
+    )
+
+
 def build_loaders(args, device: torch.device):
 
     preprocessor = FacePreprocessor()
+    streaming = args.data_source == "hf-stream"
+
+    def make_dataset(split: str, transform):
+        common = dict(
+            use_physics=args.mode in PHYSICS_MODES,
+            use_prnu=args.mode in PRNU_MODES,
+            use_semantic=args.mode in SEMANTIC_MODES,
+            semantic_model=args.semantic_model,
+            semantic_pretrained=not args.no_semantic_pretrained,
+            preprocessor=preprocessor,
+            transform=transform,
+        )
+        if streaming:
+            return StreamingFaceBinaryDataset(
+                repo_id=args.hf_dataset_repo,
+                split=split,
+                seed=args.seed,
+                **common,
+            )
+        return FaceBinaryDataset(
+            root=args.data_dir,
+            split=split,
+            val_ratio=args.val_ratio,
+            seed=args.seed,
+            **common,
+        )
 
     # --------------------------------------------------------
     # Training dataset
     # --------------------------------------------------------
 
-    train_ds = FaceBinaryDataset(
-        root=args.data_dir,
-        split="train",
-        val_ratio=args.val_ratio,
-        seed=args.seed,
-        use_physics=args.mode in PHYSICS_MODES,
-        use_prnu=args.mode in PRNU_MODES,
-        use_semantic=args.mode in SEMANTIC_MODES,
-        semantic_model=args.semantic_model,
-        semantic_pretrained=not args.no_semantic_pretrained,
-        preprocessor=preprocessor,
-        transform=get_train_transforms(),
-    )
+    train_ds = make_dataset("train", get_train_transforms())
 
-    if getattr(args, "max_train_per_class", 0) > 0:
+    if not streaming and getattr(args, "max_train_per_class", 0) > 0:
         before = len(train_ds.samples)
         train_ds.samples = subsample_balanced(
             train_ds.samples, args.max_train_per_class, args.seed
         )
         print(f"Training subset: {before} -> {len(train_ds.samples)} images "
               f"(max {args.max_train_per_class} per class)")
+    elif streaming and getattr(args, "max_train_per_class", 0) > 0:
+        print("WARNING: --max-train-per-class is ignored for hf-stream datasets.")
 
     # --------------------------------------------------------
     # Validation dataset
     # --------------------------------------------------------
 
-    val_ds = FaceBinaryDataset(
-        root=args.data_dir,
-        split="val",
-        val_ratio=args.val_ratio,
-        seed=args.seed,
-        use_physics=args.mode in PHYSICS_MODES,
-        use_prnu=args.mode in PRNU_MODES,
-        use_semantic=args.mode in SEMANTIC_MODES,
-        semantic_model=args.semantic_model,
-        semantic_pretrained=not args.no_semantic_pretrained,
-        preprocessor=preprocessor,
-        transform=get_val_transforms(),
-    )
+    val_ds = make_dataset("val", get_val_transforms())
 
     # --------------------------------------------------------
     # DataLoaders
@@ -710,7 +881,7 @@ def build_loaders(args, device: torch.device):
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=not streaming,
         num_workers=args.num_workers,
         pin_memory=(device.type == "cuda"),
         **_loader_extras(args, persistent=True),
@@ -728,15 +899,7 @@ def build_loaders(args, device: torch.device):
     if args.mode not in NEEDS_TEST_LOADER:
         return train_loader, val_loader
 
-    test_ds = FaceBinaryDataset(
-        root=args.data_dir, split="test", seed=args.seed,
-        use_physics=args.mode in PHYSICS_MODES,
-        use_prnu=args.mode in PRNU_MODES,
-        use_semantic=args.mode in SEMANTIC_MODES,
-        semantic_model=args.semantic_model, preprocessor=preprocessor,
-        semantic_pretrained=not args.no_semantic_pretrained,
-        transform=get_val_transforms(),
-    )
+    test_ds = make_dataset("test", get_val_transforms())
     test_loader = DataLoader(
         test_ds, batch_size=args.batch_size, shuffle=False,
         num_workers=args.num_workers, pin_memory=(device.type == "cuda"),
@@ -971,6 +1134,7 @@ def _full_hybrid_epoch(
     total_epochs=None,
     start_batch: int = 0,
     checkpoint_callback=None,
+    total_batches: Optional[int] = None,
   ) -> Dict[str, float]:
 
     training = optimizer is not None
@@ -1005,7 +1169,7 @@ def _full_hybrid_epoch(
     progress_bar = tqdm(
         loader,
         desc=progress_desc,
-        total=len(loader),
+        total=total_batches,
         leave=True,
         dynamic_ncols=True,
     )
@@ -1153,7 +1317,7 @@ def _full_hybrid_epoch(
             progress_bar.set_postfix(
                 loss=f"{running_loss:.4f}",
                 acc=f"{running_acc:.4f}",
-                batch=f"{batch_idx}/{len(loader)}",
+                batch=f"{batch_idx}/{total_batches}" if total_batches is not None else str(batch_idx),
             )
 
             if (
@@ -1245,6 +1409,7 @@ def train_epoch_full_hybrid(
     total_epochs,
     start_batch: int = 0,
     checkpoint_callback=None,
+    total_batches: Optional[int] = None,
 ):
     return _full_hybrid_epoch(
         model,
@@ -1256,6 +1421,7 @@ def train_epoch_full_hybrid(
         total_epochs,
         start_batch=start_batch,
         checkpoint_callback=checkpoint_callback,
+        total_batches=total_batches,
     )
 
 
@@ -1267,6 +1433,7 @@ def eval_full_hybrid(
     device,
     epoch=None,
     total_epochs=None,
+    total_batches: Optional[int] = None,
 ):
     return _full_hybrid_epoch(
         model,
@@ -1276,6 +1443,7 @@ def eval_full_hybrid(
         None,
         epoch,
         total_epochs,
+        total_batches=total_batches,
     )
 
 
@@ -1351,11 +1519,11 @@ def run_stage1(
     train_loader, val_loader, test_loader = build_loaders(args, device)
 
     print(
-        f"\nTraining batches: {len(train_loader)}"
+        f"\nTraining batches: {_loader_batches(train_loader, args, 'train')}"
     )
 
     print(
-        f"Validation batches: {len(val_loader)}"
+        f"Validation batches: {_loader_batches(val_loader, args, 'val')}"
     )
 
     # --------------------------------------------------------
@@ -1576,11 +1744,11 @@ def run_hybrid(
     )
 
     print(
-        f"\nTraining batches: {len(train_loader)}"
+        f"\nTraining batches: {_loader_batches(train_loader, args, 'train')}"
     )
 
     print(
-        f"Validation batches: {len(val_loader)}"
+        f"Validation batches: {_loader_batches(val_loader, args, 'val')}"
     )
 
     # --------------------------------------------------------
@@ -1814,13 +1982,17 @@ def run_full_hybrid(args, device) -> None:
     # ------------------------------------------------------------
     from src.features.feature_scalers import fit_physics_and_prnu_scalers
 
-    train_paths = [
-        path for path, _, _ in train_loader.dataset.samples
-    ]
-
-    physics_normalizer, prnu_normalizer = (
-        fit_physics_and_prnu_scalers(train_paths)
-    )
+    if args.data_source == "hf-stream":
+        physics_normalizer, prnu_normalizer = fit_streaming_feature_scalers(
+            train_loader.dataset
+        )
+    else:
+        train_paths = [
+            path for path, _, _ in train_loader.dataset.samples
+        ]
+        physics_normalizer, prnu_normalizer = (
+            fit_physics_and_prnu_scalers(train_paths)
+        )
 
     # ------------------------------------------------------------
     # Create model
@@ -2006,6 +2178,7 @@ def run_full_hybrid(args, device) -> None:
                 args.epochs,
                 start_batch=epoch_start_batch,
                 checkpoint_callback=checkpoint_callback,
+                total_batches=_loader_batches(train_loader, args, "train"),
             )
 
             val_metrics = eval_full_hybrid(
@@ -2015,6 +2188,7 @@ def run_full_hybrid(args, device) -> None:
                 device,
                 epoch,
                 args.epochs,
+                total_batches=_loader_batches(val_loader, args, "val"),
             )
 
             # Correct scheduler order: optimizer.step() happens inside the
@@ -2057,7 +2231,7 @@ def run_full_hybrid(args, device) -> None:
                 physics_normalizer,
                 prnu_normalizer,
                 scheduler=scheduler,
-                batch_idx=len(train_loader),
+                batch_idx=_loader_batches(train_loader, args, "train"),
                 epoch_complete=True,
                 best_acc=best_acc,
             )
@@ -2091,7 +2265,7 @@ def run_full_hybrid(args, device) -> None:
                     physics_normalizer,
                     prnu_normalizer,
                     scheduler=scheduler,
-                    batch_idx=len(train_loader),
+                    batch_idx=_loader_batches(train_loader, args, "train"),
                     epoch_complete=True,
                     best_acc=best_acc,
                 )
@@ -2395,6 +2569,34 @@ def parse_args():
     )
 
     parser.add_argument(
+        "--data-source",
+        choices=["local", "hf-stream"],
+        default="local",
+        help="Read local --data-dir folders (default) or stream WebDataset shards from Hugging Face.",
+    )
+
+    parser.add_argument(
+        "--hf-dataset-repo",
+        type=str,
+        default="",
+        help="Public Hugging Face dataset repo with train/, val/, and test/ WebDataset shards.",
+    )
+
+    parser.add_argument(
+        "--known-train-size",
+        type=int,
+        default=722_869,
+        help="Known number of streamed training samples; used where IterableDataset has no length.",
+    )
+
+    parser.add_argument(
+        "--known-val-size",
+        type=int,
+        default=8_375,
+        help="Known number of streamed validation samples; used where IterableDataset has no length.",
+    )
+
+    parser.add_argument(
         "--output-dir",
         type=str,
         default="models",
@@ -2556,6 +2758,15 @@ def main() -> None:
     global AMP_ENABLED
     args = parse_args()
 
+    if args.data_source == "hf-stream" and args.mode != "full_hybrid":
+        raise ValueError("--data-source hf-stream is currently supported only with --mode full_hybrid.")
+    if args.data_source == "hf-stream" and not args.hf_dataset_repo:
+        raise ValueError("--hf-dataset-repo is required with --data-source hf-stream.")
+    if args.data_source == "hf-stream" and (
+        args.known_train_size < args.batch_size or args.known_val_size < args.batch_size
+    ):
+        raise ValueError("Known streamed train/val sizes must each be at least one batch.")
+
     set_seed(
         args.seed
     )
@@ -2594,7 +2805,8 @@ def main() -> None:
     print("=" * 60)
 
     print("Mode:", args.mode)
-    print("Data:", args.data_dir)
+    print("Data:", args.hf_dataset_repo if args.data_source == "hf-stream" else args.data_dir)
+    print("Data source:", args.data_source)
     print("Output:", args.output_dir)
     print("Backbone:", args.backbone)
     print("Epochs:", args.epochs)

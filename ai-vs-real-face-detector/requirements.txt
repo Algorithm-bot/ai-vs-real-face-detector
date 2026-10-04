@@ -10,6 +10,8 @@ dlib>=19.24.0
 tqdm>=4.65.0
 pytest>=7.4.0
 pytest-cov>=4.1.0
+datasets>=2.14.0
+webdataset>=0.2.0
 
 # API / DB
 fastapi>=0.100.0
