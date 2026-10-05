@@ -441,6 +441,7 @@ class FaceBinaryDataset(Dataset):
         semantic_pretrained: bool = True,
         preprocessor: Optional[FacePreprocessor] = None,
         transform=None,
+        feature_cache_dir: Optional[str] = None,
     ) -> None:
 
         if split not in {"train", "val", "test"}:
@@ -497,7 +498,21 @@ class FaceBinaryDataset(Dataset):
         samples: List[Tuple[str, int, str]] = []
 
         if self.explicit_split_layout:
-            samples = collect_labeled_images(self.root / split)
+            file_list_path = (
+                Path(feature_cache_dir) / f"{split}_file_list.json"
+                if feature_cache_dir
+                else None
+            )
+            if file_list_path is not None and file_list_path.exists():
+                print(f"Loading cached file list for {split}...", flush=True)
+                samples = [
+                    tuple(sample)
+                    for sample in json.loads(
+                        file_list_path.read_text(encoding="utf-8")
+                    )
+                ]
+            else:
+                samples = collect_labeled_images(self.root / split)
         else:
             for label, subdir in ((0, "real"), (1, "fake")):
                 folder = self.root / subdir
@@ -1094,6 +1109,7 @@ def build_loaders(args, device: torch.device):
             split=split,
             val_ratio=args.val_ratio,
             seed=args.seed,
+            feature_cache_dir=args.feature_cache,
             **common,
         )
 

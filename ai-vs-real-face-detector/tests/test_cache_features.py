@@ -1,6 +1,7 @@
 import json
 
 from src import cache_features
+from src.train import FaceBinaryDataset
 
 
 def test_main_reuses_cached_file_list(tmp_path, monkeypatch):
@@ -47,6 +48,38 @@ def test_main_reuses_cached_file_list(tmp_path, monkeypatch):
 
     assert len(collected_samples) == 1
     assert processed_samples == [cached_samples, cached_samples]
+
+
+def test_face_dataset_reuses_cached_file_list(tmp_path, monkeypatch, capsys):
+    data_root = tmp_path / "data"
+    for split in ("train", "val", "test"):
+        for label in ("real", "fake"):
+            (data_root / split / label).mkdir(parents=True)
+
+    cached_samples = [
+        (str(data_root / "train" / "real" / "cached.jpg"), 0, "lsun"),
+        (str(data_root / "train" / "fake" / "cached.jpg"), 1, "synthetic"),
+    ]
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    (cache_dir / "train_file_list.json").write_text(
+        json.dumps(cached_samples),
+        encoding="utf-8",
+    )
+
+    def unexpected_collect(_split_root):
+        raise AssertionError("Cached file list should avoid live enumeration")
+
+    monkeypatch.setattr("src.train.collect_labeled_images", unexpected_collect)
+    dataset = FaceBinaryDataset(
+        str(data_root),
+        split="train",
+        use_physics=False,
+        feature_cache_dir=str(cache_dir),
+    )
+
+    assert dataset.samples == cached_samples
+    assert "Loading cached file list for train..." in capsys.readouterr().out
 
 
 def test_collect_labeled_images_reports_enumeration_progress(tmp_path, capsys):
