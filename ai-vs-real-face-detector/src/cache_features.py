@@ -180,7 +180,19 @@ def main():
     (cache_dir / "meta.json").write_text(json.dumps(meta, indent=2))
 
     for split in args.splits:
-        samples = collect_labeled_images(Path(args.data_dir) / split)
+        file_list_path = cache_dir / f"{split}_file_list.json"
+        if file_list_path.exists():
+            print(f"Loading cached file list for {split}...", flush=True)
+            samples = json.loads(file_list_path.read_text(encoding="utf-8"))
+            samples = [tuple(sample) for sample in samples]
+        else:
+            print(f"Enumerating files for {split} (first time only)...", flush=True)
+            samples = collect_labeled_images(Path(args.data_dir) / split)
+            file_list_path.write_text(json.dumps(samples), encoding="utf-8")
+            print(
+                f"Enumeration complete: {len(samples)} files, cached to {file_list_path}",
+                flush=True,
+            )
         if not samples:
             raise FileNotFoundError(f"No images under {Path(args.data_dir) / split}")
         if split == "train" and args.max_train_per_class > 0:

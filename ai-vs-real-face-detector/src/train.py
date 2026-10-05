@@ -222,12 +222,22 @@ def _collect_under_label_root(
 ) -> None:
     """Recursively collect images from one real/ or fake/ root only."""
     folder_str = str(folder)
+    directories_processed = 0
+    files_processed = 0
     for current_root, dirs, files in os.walk(folder_str, followlinks=False):
+        directories_processed += 1
         dirs.sort()
         files.sort()
         rel_parent = _posix_relpath(current_root, folder_str)
         source = rel_parent or default
         for filename in files:
+            files_processed += 1
+            if files_processed % 10_000 == 0:
+                print(
+                    f"[enumeration] processed {files_processed:,} files across "
+                    f"{directories_processed:,} directories; found {len(samples):,} images",
+                    flush=True,
+                )
             suffix = os.path.splitext(filename)[1].lower()
             if suffix not in IMAGE_EXTENSIONS:
                 continue
@@ -236,6 +246,12 @@ def _collect_under_label_root(
                 continue
             seen.add(path)
             samples.append((path, label, source))
+        if directories_processed % 100 == 0:
+            print(
+                f"[enumeration] processed {directories_processed:,} directories; "
+                f"found {len(samples):,} images",
+                flush=True,
+            )
 
 
 def _collect_cnndetection_images(split_root: Path) -> List[Tuple[str, int, str]]:
@@ -243,10 +259,19 @@ def _collect_cnndetection_images(split_root: Path) -> List[Tuple[str, int, str]]
     samples: List[Tuple[str, int, str]] = []
     seen = set()
     split_root_str = str(split_root)
+    directories_processed = 0
+    files_processed = 0
 
     for current_root, dirs, files in os.walk(split_root_str, followlinks=False):
+        directories_processed += 1
         dirs.sort()
         files.sort()
+        if directories_processed % 100 == 0:
+            print(
+                f"[enumeration] processed {directories_processed:,} directories; "
+                f"found {len(samples):,} images",
+                flush=True,
+            )
         rel = _posix_relpath(current_root, split_root_str)
         parts = Path(rel).parts if rel else ()
         label_index = None
@@ -278,6 +303,13 @@ def _collect_cnndetection_images(split_root: Path) -> List[Tuple[str, int, str]]
         item_source = nested_after_label or source_from_parent or default
 
         for filename in files:
+            files_processed += 1
+            if files_processed % 10_000 == 0:
+                print(
+                    f"[enumeration] processed {files_processed:,} files across "
+                    f"{directories_processed:,} directories; found {len(samples):,} images",
+                    flush=True,
+                )
             suffix = os.path.splitext(filename)[1].lower()
             if suffix not in IMAGE_EXTENSIONS:
                 continue
