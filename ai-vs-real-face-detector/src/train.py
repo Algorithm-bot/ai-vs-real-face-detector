@@ -679,7 +679,7 @@ class FaceBinaryDataset(Dataset):
             f"  TOTAL: {len(self.samples)}"
         )
 
-        cache_dir = os.environ.get("FEATURE_CACHE_DIR")
+        cache_dir = feature_cache_dir or os.environ.get("FEATURE_CACHE_DIR")
         if cache_dir and (use_physics or use_prnu or use_semantic):
             self.attach_feature_cache(cache_dir, split)
 

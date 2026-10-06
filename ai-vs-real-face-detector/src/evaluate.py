@@ -18,6 +18,7 @@ from tqdm import tqdm
 
 import numpy as np
 import torch
+from torch.utils.data import DataLoader
 from sklearn.metrics import (
     accuracy_score,
     auc,
@@ -95,6 +96,7 @@ def _dataset_for_evaluation(
     data_dir: Path,
     checkpoint_args: dict[str, Any],
     mode: str,
+    feature_cache: Path | None = None,
 ):
     """Prefer an explicit test directory; otherwise mirror the training split."""
     dataset_options = {
@@ -109,6 +111,7 @@ def _dataset_for_evaluation(
             not checkpoint_args.get("no_semantic_pretrained", False),
         ),
         "transform": get_val_transforms(),
+        "feature_cache_dir": str(feature_cache) if feature_cache else None,
     }
     seed = int(checkpoint_args.get("seed", 42))
     if _has_explicit_split_layout(data_dir) or all(
@@ -188,7 +191,13 @@ def save_plots(labels: Sequence[int], scores: Sequence[float], output_dir: Path)
         fig, ax = plt.subplots(); ax.plot(recall, precision); ax.set(xlabel="Recall", ylabel="Precision", title="Precision-recall curve"); fig.tight_layout(); fig.savefig(output_dir / "precision_recall_curve.png", dpi=160); plt.close(fig)
 
 
-def evaluate(checkpoint: Path, data_dir: Path, output_dir: Path, device_name: str | None = None) -> dict[str, Any]:
+def evaluate(
+    checkpoint: Path,
+    data_dir: Path,
+    output_dir: Path,
+    device_name: str | None = None,
+    feature_cache: Path | None = None,
+) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
     device = torch.device(device_name or (
         "mps" if torch.backends.mps.is_available()
@@ -202,6 +211,7 @@ def evaluate(checkpoint: Path, data_dir: Path, output_dir: Path, device_name: st
             data_dir,
             raw_checkpoint.get("args", {}),
             mode,
+            feature_cache,
         )
     except FileNotFoundError as exc:
         (output_dir / "data_leakage_report.txt").write_text(
@@ -217,30 +227,40 @@ def evaluate(checkpoint: Path, data_dir: Path, output_dir: Path, device_name: st
 
     model, mode = load_model(str(checkpoint), device)
     rows: list[dict[str, Any]] = []
+    loader = DataLoader(dataset, batch_size=32, shuffle=False)
     with torch.no_grad():
-        for index in tqdm(range(len(dataset)), desc="Evaluating", unit="img"):
-            item = dataset[index]
-            image = item["image"].unsqueeze(0).to(device)
+        for batch in tqdm(loader, desc="Evaluating", unit="batch"):
+            image = batch["image"].to(device)
             if mode == "stage1":
                 logits, _ = model(image)
             elif mode == "hybrid":
-                physics = item["physics"].unsqueeze(0).to(device)
+                physics = batch["physics"].to(device)
                 logits, _ = model(image, physics)
             elif mode == "full_hybrid":
-                physics = item["physics"].unsqueeze(0).to(device)
-                prnu = item["prnu"].unsqueeze(0).to(device)
-                semantic = item["semantic"].unsqueeze(0).to(device)
+                physics = batch["physics"].to(device)
+                prnu = batch["prnu"].to(device)
+                semantic = batch["semantic"].to(device)
                 logits, _ = model(image, physics, prnu, semantic)
             elif mode == "physics_only":
-                logits, _ = model(item["physics"].unsqueeze(0).to(device))
+                logits, _ = model(batch["physics"].to(device))
             elif mode == "prnu_only":
-                logits, _ = model(item["prnu"].unsqueeze(0).to(device))
+                logits, _ = model(batch["prnu"].to(device))
             elif mode == "semantic_only":
-                logits, _ = model(item["semantic"].unsqueeze(0).to(device))
+                logits, _ = model(batch["semantic"].to(device))
             else:
                 raise ValueError(f"Unsupported checkpoint mode: {mode}")
-            probs = torch.softmax(logits, dim=1)[0].cpu().numpy()
-            rows.append({"path": item["path"], "source": item["source"], "true_label": int(item["label"]), "predicted_label": int(np.argmax(probs)), "probability_real": float(probs[0]), "probability_ai": float(probs[1])})
+            probabilities = torch.softmax(logits, dim=1).cpu().numpy()
+            for path, source, label, probs in zip(
+                batch["path"], batch["source"], batch["label"], probabilities
+            ):
+                rows.append({
+                    "path": path,
+                    "source": source,
+                    "true_label": int(label),
+                    "predicted_label": int(np.argmax(probs)),
+                    "probability_real": float(probs[0]),
+                    "probability_ai": float(probs[1]),
+                })
 
     labels = [row["true_label"] for row in rows]
     scores = [row["probability_ai"] for row in rows]
@@ -296,6 +316,7 @@ def run_ablation(
     data_dir: Path,
     output_dir: Path,
     device_name: str | None = None,
+    feature_cache: Path | None = None,
 ) -> dict[str, Any]:
     """Evaluate independently trained branch checkpoints plus the full model.
 
@@ -320,7 +341,7 @@ def run_ablation(
     results: dict[str, Any] = {"variants": {}, "comparison": []}
     for name, path in checkpoints.items():
         variant_dir = output_dir / name
-        metrics = evaluate(path, data_dir, variant_dir, device_name)
+        metrics = evaluate(path, data_dir, variant_dir, device_name, feature_cache)
         overall = metrics.get("overall", {})
         results["variants"][name] = {
             "checkpoint": str(path),
@@ -349,12 +370,17 @@ def main() -> None:
     parser.add_argument("--data-dir", type=Path, default=PROJECT_ROOT / "data")
     parser.add_argument("--output-dir", type=Path, default=PROJECT_ROOT / "evaluation_outputs")
     parser.add_argument("--device", default=None)
+    parser.add_argument("--feature-cache", type=Path, default=None)
     parser.add_argument("--ablation", action="store_true", help="Compare independently trained branch checkpoints")
     args = parser.parse_args()
     if args.ablation:
-        print(json.dumps(run_ablation(args.checkpoint, args.data_dir, args.output_dir, args.device), indent=2))
+        print(json.dumps(run_ablation(
+            args.checkpoint, args.data_dir, args.output_dir, args.device, args.feature_cache
+        ), indent=2))
     else:
-        print(json.dumps(evaluate(args.checkpoint, args.data_dir, args.output_dir, args.device), indent=2))
+        print(json.dumps(evaluate(
+            args.checkpoint, args.data_dir, args.output_dir, args.device, args.feature_cache
+        ), indent=2))
 
 
 if __name__ == "__main__":

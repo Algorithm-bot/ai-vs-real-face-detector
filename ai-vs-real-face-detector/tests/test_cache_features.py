@@ -82,6 +82,32 @@ def test_face_dataset_reuses_cached_file_list(tmp_path, monkeypatch, capsys):
     assert "Loading cached file list for train..." in capsys.readouterr().out
 
 
+def test_face_dataset_attaches_feature_cache_from_argument(tmp_path, monkeypatch):
+    data_root = tmp_path / "data"
+    for split in ("train", "val", "test"):
+        for label in ("real", "fake"):
+            label_root = data_root / split / label
+            label_root.mkdir(parents=True)
+            (label_root / "image.jpg").write_bytes(b"image")
+
+    attached = []
+    monkeypatch.setattr(
+        FaceBinaryDataset,
+        "attach_feature_cache",
+        lambda self, cache_dir, split: attached.append((cache_dir, split)),
+    )
+    cache_dir = tmp_path / "cache"
+    dataset = FaceBinaryDataset(
+        str(data_root),
+        split="train",
+        use_semantic=True,
+        feature_cache_dir=str(cache_dir),
+    )
+
+    assert len(dataset.samples) == 2
+    assert attached == [(str(cache_dir), "train")]
+
+
 def test_collect_labeled_images_reports_enumeration_progress(tmp_path, capsys):
     split_root = tmp_path / "train"
     real_root = split_root / "real"
