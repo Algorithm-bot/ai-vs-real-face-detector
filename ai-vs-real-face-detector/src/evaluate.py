@@ -138,7 +138,7 @@ def _dataset_for_evaluation(
         # With val_ratio=0 the train split includes every explicit test image.
         ds = FaceBinaryDataset(
             str(root),
-            split="test",
+            split="train",
             val_ratio=0.0,
             seed=seed,
             **dataset_options,
