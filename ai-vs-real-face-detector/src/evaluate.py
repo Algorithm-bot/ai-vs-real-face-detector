@@ -14,6 +14,7 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Iterable, Sequence
+from tqdm import tqdm
 
 import numpy as np
 import torch
@@ -217,7 +218,7 @@ def evaluate(checkpoint: Path, data_dir: Path, output_dir: Path, device_name: st
     model, mode = load_model(str(checkpoint), device)
     rows: list[dict[str, Any]] = []
     with torch.no_grad():
-        for index in range(len(dataset)):
+        for index in tqdm(range(len(dataset)), desc="Evaluating", unit="img"):
             item = dataset[index]
             image = item["image"].unsqueeze(0).to(device)
             if mode == "stage1":
