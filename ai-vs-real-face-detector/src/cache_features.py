@@ -52,6 +52,12 @@ from src.semantic_branch.encoder import (
 )
 
 
+def _prnu_view(rgb, m=256):
+    h, w = rgb.shape[:2]
+    y, x = (h - min(h, m)) // 2, (w - min(w, m)) // 2
+    return rgb[y:y + min(h, m), x:x + min(w, m)]
+
+
 class FeatureDataset(Dataset):
     def __init__(self, samples):
         self.samples = samples
@@ -72,7 +78,7 @@ class FeatureDataset(Dataset):
                 raise IOError("unreadable image")
             rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
             p = np.asarray(self.physics.extract(rgb).vector, dtype=np.float32)
-            q = np.asarray(self.prnu.extract(rgb).vector, dtype=np.float32)
+            q = np.asarray(self.prnu.extract(_prnu_view(rgb)).vector, dtype=np.float32)
             v = cv2.resize(rgb, (224, 224), interpolation=cv2.INTER_AREA)  # same as SemanticEncoder
             ok = 1
         except Exception as exc:  # keep a long job alive; bad images are dropped later
