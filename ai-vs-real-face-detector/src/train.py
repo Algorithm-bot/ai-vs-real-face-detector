@@ -28,6 +28,42 @@ from sklearn.metrics import accuracy_score, confusion_matrix, precision_recall_f
 
 
 # ============================================================
+# EARLY STOPPING
+# ============================================================
+
+class EarlyStopping:
+    """Stop when the monitored validation metric fails to improve for N epochs."""
+
+    def __init__(self, patience: int = 5, best_score: float = -1.0) -> None:
+        if patience < 1:
+            raise ValueError("Early-stopping patience must be at least 1.")
+        self.patience = patience
+        self.best_score = best_score
+        self.bad_epochs = 0
+
+    def step(self, score: float, epoch: int) -> bool:
+        # The training code uses validation accuracy for best-checkpoint selection,
+        # so early stopping monitors the same metric for consistent behavior.
+        if score > self.best_score:
+            self.best_score = score
+            self.bad_epochs = 0
+            return False
+
+        self.bad_epochs += 1
+        print(
+            f"[EarlyStopping] No validation-accuracy improvement for "
+            f"{self.bad_epochs}/{self.patience} epoch(s)."
+        )
+        if self.bad_epochs >= self.patience:
+            print(
+                f"[EarlyStopping] Stopping after epoch {epoch}; "
+                f"best validation accuracy={self.best_score:.4f}."
+            )
+            return True
+        return False
+
+
+# ============================================================
 # PROJECT PATH
 # ============================================================
 
@@ -1892,6 +1928,11 @@ def run_stage1(
     else:
         print("\nNo last training checkpoint found. Starting training from Epoch 1.")
 
+    early_stopper = EarlyStopping(
+        patience=args.early_stopping_patience,
+        best_score=best_acc,
+    )
+
     if start_epoch > args.epochs:
 
         print("\nTraining already reached requested epoch count.")
@@ -1972,6 +2013,9 @@ def run_stage1(
                     scheduler=scheduler,
                     best_acc=best_acc,
                 )
+
+            if early_stopper.step(val_metrics["acc"], epoch):
+                break
 
     # --------------------------------------------------------
     # Save history
@@ -2143,6 +2187,10 @@ def run_hybrid(
     best_acc = 0.0
 
     history = []
+    early_stopper = EarlyStopping(
+        patience=args.early_stopping_patience,
+        best_score=best_acc,
+    )
 
     for epoch in range(
         1,
@@ -2206,6 +2254,9 @@ def run_hybrid(
 
                 args,
             )
+
+        if early_stopper.step(val_metrics["acc"], epoch):
+            break
 
     # --------------------------------------------------------
     # Save history
@@ -2419,6 +2470,11 @@ def run_full_hybrid(args, device) -> None:
         print("\nNo last training checkpoint found.")
         print("Starting training from Epoch 1.")
 
+    early_stopper = EarlyStopping(
+        patience=args.early_stopping_patience,
+        best_score=best_acc,
+    )
+
     # ------------------------------------------------------------
     # TRAINING
     # ------------------------------------------------------------
@@ -2587,6 +2643,8 @@ def run_full_hybrid(args, device) -> None:
                 print("New best checkpoint saved.")
 
             start_batch = 0
+            if early_stopper.step(val_metrics["acc"], epoch):
+                break
 
     # ------------------------------------------------------------
     # TEST BEST MODEL
@@ -2791,6 +2849,11 @@ def run_branch_only(args, device) -> None:
     else:
         print("\nNo last training checkpoint found. Starting training from Epoch 1.")
 
+    early_stopper = EarlyStopping(
+        patience=args.early_stopping_patience,
+        best_score=best_acc,
+    )
+
     if start_epoch > args.epochs:
         print("\nTraining already reached requested epoch count.")
         print(f"Checkpoint epoch = {start_epoch - 1}, requested epochs = {args.epochs}")
@@ -2824,6 +2887,9 @@ def run_branch_only(args, device) -> None:
                 prnu_normalizer=prnu_normalizer if mode == "prnu_only" else None,
                 scheduler=scheduler, best_acc=best_acc,
             )
+
+        if early_stopper.step(val_metrics["acc"], epoch):
+            break
 
     if not best_path.exists():
         raise RuntimeError(f"No {mode} checkpoint was saved.")
@@ -2974,6 +3040,13 @@ def parse_args():
         "--epochs",
         type=int,
         default=10,
+    )
+
+    parser.add_argument(
+        "--early-stopping-patience",
+        type=int,
+        default=5,
+        help="Stop when validation accuracy fails to improve for this many consecutive epochs.",
     )
 
     parser.add_argument(
