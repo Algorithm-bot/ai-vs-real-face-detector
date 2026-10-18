@@ -21,6 +21,11 @@ from .shadow_geometry import ShadowGeometryResult, analyze_shadow_geometry
 
 
 PHYSICS_FEATURE_NAMES: List[str] = list(SCENE_PHYSICS_FEATURE_NAMES)
+# Keep the classifier contract at 22 dimensions. The first six scene-level
+# optical cues are illumination uniformity, illumination-gradient magnitude,
+# left/right brightness difference, top/bottom brightness difference, shadow
+# coverage, and highlight coverage; the remaining cues add spectral, texture,
+# noise, colour, and symmetry evidence.
 PHYSICS_FEATURE_DIM = len(PHYSICS_FEATURE_NAMES)
 
 

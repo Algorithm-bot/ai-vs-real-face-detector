@@ -208,10 +208,14 @@ def main():
     ap.add_argument("--no-semantic-pretrained", action="store_true")
     ap.add_argument("--preprocess", choices=["crop", "resize"], default="crop",
                     help="crop = random crop on train, center crop on test; resize = legacy")
-    ap.add_argument("--augment", action="store_true",
+    ap.add_argument("--augment", "--augment-train", dest="augment", action="store_true",
                     help="Apply training augmentation (Blur+JPEG) at raw resolution before crop")
+    ap.add_argument("--branches", default="deep,physics,semantic,freq",
+                    help="Comma-separated branches cached (default: deep,physics,semantic,freq; prnu is off)")
     ap.add_argument("--splits", nargs="+", default=["train", "val", "test"])
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--subset-seed", type=int, default=42,
+                    help="Random seed used only for balanced subset selection; training seed remains for init/order.")
     ap.add_argument("--force", action="store_true")
     args = ap.parse_args()
 
@@ -243,12 +247,14 @@ def main():
         "prnu_dim": PRNU_FEATURE_DIM,
         "freq_dim": FREQ_FEATURE_DIM,
         "semantic_dim": int(encoder.embedding_dim),
+        "branches": sorted({branch.strip() for branch in args.branches.split(",") if branch.strip()}),
         "max_train_images": args.max_train_images,
         "max_train_per_class": effective_per_class,
         "preprocess": args.preprocess,
         "crop_size": 224,
         "augment": bool(args.augment),
         "seed": args.seed,
+        "subset_seed": getattr(args, "subset_seed", args.seed),
     }
     (cache_dir / "meta.json").write_text(json.dumps(meta, indent=2))
 
@@ -273,8 +279,9 @@ def main():
             raise FileNotFoundError(f"No images under {Path(args.data_dir) / split}")
         if split == "train" and (args.max_train_images > 0 or args.max_train_per_class > 0):
             before = len(samples)
-            samples = subsample_balanced(samples, effective_per_class, args.seed)
-            print(f"[train] subset {before} -> {len(samples)} images (max_train_images={args.max_train_images}, per_class={effective_per_class})")
+            subset_seed = getattr(args, "subset_seed", args.seed)
+            samples = subsample_balanced(samples, effective_per_class, subset_seed)
+            print(f"[train] subset {before} -> {len(samples)} images (max_train_images={args.max_train_images}, per_class={effective_per_class}, subset_seed={subset_seed})")
         process_split(split, samples, encoder, device, cache_dir, args)
 
     print("Feature cache complete:", cache_dir)

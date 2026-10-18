@@ -106,6 +106,14 @@ def evaluate_predictions(
         n_resamples=n_bootstrap,
         seed=seed,
     )
+    ci_05 = bootstrap_ci(
+        y_true,
+        y_score,
+        folders=folders,
+        threshold=0.5,
+        n_resamples=n_bootstrap,
+        seed=seed,
+    )
 
     return {
         "auc": summary_05["roc_auc"],
@@ -114,6 +122,7 @@ def evaluate_predictions(
         "acc_at_calibrated": summary_cal["accuracy"],
         "calibrated_threshold": calibrated_threshold,
         "ci": ci,
+        "ci_at_0.5": ci_05,
     }
 
 
@@ -139,12 +148,28 @@ def run_stacking_evaluation(
     if not np.any(report_mask):
         raise ValueError("No REPORT samples found in predictions.")
 
-    # Detect branch columns
-    all_branch_cols = [c for c in pred_df.columns if c.startswith("p_ai_") and c != "p_ai_fused"]
-    # Sort with deep first, then others
-    branch_cols = [c for c in ["p_ai_deep", "p_ai_physics", "p_ai_semantic", "p_ai_freq", "p_ai_prnu"] if c in all_branch_cols]
+    # The notebook stores one probability per evaluated mode.
+    mode_cols = sorted(
+        c for c in pred_df.columns
+        if c.startswith("p_ai__") and c != "p_ai__full_hybrid"
+    )
+    legacy_cols = [
+        c for c in ["p_ai_deep", "p_ai_physics", "p_ai_semantic", "p_ai_freq", "p_ai_prnu"]
+        if c in pred_df.columns
+    ]
+    branch_cols = mode_cols or legacy_cols
     if not branch_cols:
         raise ValueError(f"No branch probability columns found in: {list(pred_df.columns)}")
+    deep_col = (
+        "p_ai__stage1" if "p_ai__stage1" in pred_df
+        else "p_ai_deep" if "p_ai_deep" in pred_df
+        else branch_cols[0]
+    )
+    hybrid_col = (
+        "p_ai__full_hybrid" if "p_ai__full_hybrid" in pred_df
+        else "p_ai_fused" if "p_ai_fused" in pred_df
+        else None
+    )
 
     df_dev = pred_df[dev_mask].copy()
     df_rep = pred_df[report_mask].copy()
@@ -159,16 +184,19 @@ def run_stacking_evaluation(
 
     # 1. Fit stacker on DEV
     stacker, fit_info = fit_stacker_on_dev(X_dev, y_dev, groups=groups_dev, seed=seed)
-    weights = {col.replace("p_ai_", ""): round(float(w), 4) for col, w in zip(branch_cols, stacker.coef_[0])}
+    weights = {
+        col.removeprefix("p_ai__").removeprefix("p_ai_"): round(float(w), 4)
+        for col, w in zip(branch_cols, stacker.coef_[0])
+    }
     intercept = round(float(stacker.intercept_[0]), 4)
 
     # Predictions on DEV (to calibrate thresholds)
-    p_dev_deep = df_dev["p_ai_deep"].values if "p_ai_deep" in df_dev else X_dev[:, 0]
+    p_dev_deep = df_dev[deep_col].values
     p_dev_mean = X_dev.mean(axis=1)
     p_dev_stack = stacker.predict_proba(X_dev)[:, 1]
 
     # Predictions on REPORT
-    p_rep_deep = df_rep["p_ai_deep"].values if "p_ai_deep" in df_rep else X_rep[:, 0]
+    p_rep_deep = df_rep[deep_col].values
     p_rep_mean = X_rep.mean(axis=1)
     p_rep_stack = stacker.predict_proba(X_rep)[:, 1]
 
@@ -183,9 +211,9 @@ def run_stacking_evaluation(
         "Stacked logistic regression": (p_rep_stack, cal_th_stack),
     }
 
-    if "p_ai_fused" in df_rep.columns:
-        p_dev_fused = df_dev["p_ai_fused"].values
-        p_rep_fused = df_rep["p_ai_fused"].values
+    if hybrid_col is not None:
+        p_dev_fused = df_dev[hybrid_col].values
+        p_rep_fused = df_rep[hybrid_col].values
         cal_th_fused, _ = best_balanced_accuracy_threshold(y_dev, p_dev_fused)
         models_to_eval["Gated hybrid"] = (p_rep_fused, cal_th_fused)
 
@@ -219,7 +247,18 @@ def run_stacking_evaluation(
             "AUC": auc_str,
             "AP": ap_str,
             "Acc @ 0.5": f"{res['acc_at_0.5'] * 100:.2f}%",
+            "Acc @ 0.5 CI": (
+                f"[{res['ci_at_0.5']['accuracy']['low'] * 100:.2f}%, "
+                f"{res['ci_at_0.5']['accuracy']['high'] * 100:.2f}%]"
+                if res["ci_at_0.5"].get("accuracy", {}).get("low") is not None
+                else "N/A"
+            ),
             "Acc @ Calibrated": f"{res['acc_at_calibrated'] * 100:.2f}% (th={cal_th:.4f})",
+            "Acc @ Calibrated CI": (
+                f"[{ci['accuracy']['low'] * 100:.2f}%, {ci['accuracy']['high'] * 100:.2f}%]"
+                if ci.get("accuracy", {}).get("low") is not None
+                else "N/A"
+            ),
             "_raw_auc": res['auc'],
             "_raw_ap": res['ap'],
             "_raw_acc_05": res['acc_at_0.5'],

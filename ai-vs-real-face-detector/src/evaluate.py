@@ -177,6 +177,34 @@ def save_plots(labels: Sequence[int], scores: Sequence[float], output_dir: Path)
         plt.close(fig)
 
 
+def _tables_by_eval_split(
+    rows: list[dict[str, Any]],
+    spec,
+    calibrated_threshold: float,
+    n_bootstrap: int,
+    seed: int,
+) -> dict[str, Any]:
+    rows_by_split: dict[str, list[dict[str, Any]]] = {
+        "fold_a": [],
+        "fold_b": [],
+        "progan": [],
+    }
+    for row in rows:
+        assignment = spec.assign(str(row.get("folder") or row.get("source") or ""))
+        key = {"dev": "fold_a", "report": "fold_b", "progan": "progan"}.get(assignment)
+        if key is not None:
+            rows_by_split[key].append(row)
+    return {
+        key: build_eval_tables(
+            rows_by_split[key],
+            calibrated_threshold=calibrated_threshold,
+            n_bootstrap=n_bootstrap,
+            seed=seed,
+        )
+        for key in ("fold_a", "fold_b", "progan")
+    }
+
+
 def evaluate(
     checkpoint: Path,
     data_dir: Path,
@@ -238,7 +266,7 @@ def evaluate(
     model, mode = load_model(str(checkpoint), device)
     loader = DataLoader(dataset, batch_size=32, shuffle=False)
     collected = predict_loader(model, mode, loader, device)
-    rows = predictions_to_rows(collected, split=split_tag)
+    rows = predictions_to_rows(collected, split=split_tag, mode=mode)
     write_predictions_csv(output_dir / "predictions.csv", rows)
 
     calibration = load_calibration(checkpoint) or {}
@@ -258,6 +286,11 @@ def evaluate(
         n_bootstrap=n_bootstrap,
         seed=seed,
     )
+    if not legacy:
+        scaled_rows = [{**row, "p_ai": float(score)} for row, score in zip(rows, scaled)]
+        tables["by_eval_split"] = _tables_by_eval_split(
+            scaled_rows, spec, calibrated_threshold, n_bootstrap, seed
+        )
     write_tables_json(output_dir / "tables.json", tables)
     write_tables_csv(output_dir / "tables.csv", tables)
 

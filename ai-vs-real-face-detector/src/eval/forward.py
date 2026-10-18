@@ -120,14 +120,13 @@ def predict_loader(
     }
 
 
-def predictions_to_rows(collected: Dict[str, Any], split: str = "report") -> list:
+def predictions_to_rows(collected: Dict[str, Any], split: str = "report", mode: str = "") -> list:
     from src.eval.predictions import empty_row
 
     rows = []
     n = len(collected["label"])
     for i in range(n):
-        rows.append(
-            empty_row(
+        row = empty_row(
                 path=collected["path"][i],
                 folder=collected["folder"][i],
                 source=collected["source"][i],
@@ -136,6 +135,11 @@ def predictions_to_rows(collected: Dict[str, Any], split: str = "report") -> lis
                 logit_real=collected["logit_real"][i],
                 logit_ai=collected["logit_ai"][i],
                 split=split,
-            )
         )
+        column = {"stage1": "p_ai_deep", "full_hybrid": "p_ai_fused"}.get(
+            mode, f"p_ai_{mode}" if mode else ""
+        )
+        if column:
+            row[column] = collected["p_ai"][i]
+        rows.append(row)
     return rows

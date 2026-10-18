@@ -27,6 +27,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 import src.train as T
+from src.eval.cache_meta import check_cache_meta, requested_meta_from_args
 from src.classifier.head import BranchOnlyClassifier
 from src.features.feature_scalers import fit_physics_and_prnu_scalers
 from src.physics_branch.feature_vector import PHYSICS_FEATURE_DIM
@@ -88,6 +89,8 @@ def main():
     if not args.feature_cache:
         sys.exit("Pass --feature-cache <dir written by cache_features.py>")
 
+    check_cache_meta(args.feature_cache, requested_meta_from_args(args), legacy=bool(args.legacy))
+
     T.set_seed(args.seed)
     device = torch.device("cpu") if args.allow_cpu else T.require_gpu()
     out_dir = Path(args.output_dir)
@@ -99,10 +102,13 @@ def main():
     te = load_split(args.feature_cache, "test")
 
     rows = np.arange(len(tr["labels"]))
-    if args.max_train_per_class > 0:
+    effective_per_class = args.max_train_per_class
+    if args.max_train_images > 0:
+        effective_per_class = max(1, args.max_train_images // 2)
+    if effective_per_class > 0:
         chosen = T.subsample_balanced(
             [(int(i), int(l), "") for i, l in zip(rows, tr["labels"])],
-            args.max_train_per_class, args.seed,
+            effective_per_class, args.subset_seed,
         )
         rows = np.array(sorted(s[0] for s in chosen))
     print(f"[{mode}] train rows: {len(rows)}  val: {len(va['labels'])}  test: {len(te['labels'])}")

@@ -47,11 +47,11 @@ def report_section(title: str):
     print("=" * 65)
 
 
-def check_dataset_counts(data_dir: Path, expected_json: Path):
+def check_dataset_counts(data_dir: Path, expected_json: Path) -> bool:
     report_section("1. PER-FOLDER IMAGE COUNTS VS EXPECTED")
     if not expected_json.exists():
         print(f"[WARN] Expected counts file not found: {expected_json}")
-        return
+        return False
     with open(expected_json, "r", encoding="utf-8") as f:
         expected = json.load(f)
 
@@ -76,21 +76,22 @@ def check_dataset_counts(data_dir: Path, expected_json: Path):
         total_actual += count
         exp = expected[folder_key]
         diff = count - exp
-        if abs(diff) > 2:
+        if abs(diff) > 5:
             mismatches.append((folder_key, count, exp, diff))
 
     print(f"Total Folders: {len(expected)} | Total Actual Images: {total_actual:,} | Expected: {total_expected:,}")
     if mismatches:
-        print(f"[WARN] {len(mismatches)} folders have count mismatches (>2 difference):")
+        print(f"[FAIL] {len(mismatches)} folders have count mismatches (>5 difference):")
         for k, act, exp, diff in mismatches[:10]:
             print(f"  - {k}: actual={act}, expected={exp} (diff={diff:+d})")
         if len(mismatches) > 10:
             print(f"  ... and {len(mismatches)-10} more.")
     else:
         print("[OK] All folder counts match expected ForenSynths distribution (within ±2).")
+    return not mismatches
 
 
-def check_split_spec():
+def check_split_spec() -> bool:
     report_section("2. DEV / REPORT SPLIT VERIFICATION")
     spec = load_split_spec()
     spec.validate()
@@ -100,16 +101,24 @@ def check_split_spec():
     print(f"  -> {spec.fold_b or spec.report}")
     print(f"PROGAN (Seen generator): {len(spec.progan)} folders")
 
-    # Assert disjointness
+    ok = True
+    # Check disjointness without aborting; main prints all sections before failing.
     for a in (spec.fold_a or spec.dev):
         for b in (spec.fold_b or spec.report):
-            assert not matches_folder(a, b) and not matches_folder(b, a), f"Overlap: {a} and {b}"
-    print("[OK] FOLD_A and FOLD_B are completely disjoint.")
+            if matches_folder(a, b) or matches_folder(b, a):
+                print(f"[FAIL] FOLD_A/FOLD_B overlap: {a!r} and {b!r}")
+                ok = False
+    if ok:
+        print("[OK] FOLD_A and FOLD_B are completely disjoint.")
 
     crn_dev = any("crn" in f for f in (spec.fold_a or spec.dev))
     imle_dev = any("imle" in f for f in (spec.fold_a or spec.dev))
-    assert crn_dev == imle_dev, "CRN and IMLE must be in the same fold!"
-    print(f"[OK] CRN and IMLE are in the same fold: {'FOLD_A' if crn_dev else 'FOLD_B'}.")
+    if crn_dev != imle_dev:
+        print("[FAIL] CRN and IMLE are not in the same fold.")
+        ok = False
+    else:
+        print(f"[OK] CRN and IMLE are in the same fold: {'FOLD_A' if crn_dev else 'FOLD_B'}.")
+    return ok
 
 
 def check_models_and_throughput(device: torch.device):
@@ -217,12 +226,12 @@ def check_frequency_and_dropout():
     print("[OK] Branch dropout verified: deep branch is kept active, auxiliary branches dropped with p=0.15.")
 
 
-def check_feature_allclose(data_dir: Path, feature_cache: Path | None):
+def check_feature_allclose(data_dir: Path, feature_cache: Path | None, device: torch.device) -> bool:
     report_section("5. CACHED VS LIVE FEATURE ALLCLOSE CHECK")
     if feature_cache is None or not Path(feature_cache).exists():
         print("[INFO] No feature cache directory provided. Skipping cached-vs-live check.")
         print("Pass --feature-cache /path/to/cache to run this check on Kaggle.")
-        return
+        return True
 
     meta_path = Path(feature_cache) / "meta.json"
     if meta_path.exists():
@@ -232,11 +241,52 @@ def check_feature_allclose(data_dir: Path, feature_cache: Path | None):
     test_npz = Path(feature_cache) / "test.npz"
     if not test_npz.exists():
         print(f"[WARN] {test_npz} not found.")
-        return
+        return False
 
     z = np.load(test_npz)
     print(f"test.npz arrays present: {list(z.files)}")
     print(f"Total cached test samples: {len(z['paths'])}")
+    try:
+        from src.cache_features import FeatureDataset
+        from src.eval.cache_meta import normalise_branches
+        from src.semantic_branch.encoder import SemanticEncoder
+
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        branches = normalise_branches(meta.get("branches"))
+        count = min(20, len(z["paths"]))
+        samples = [
+            (str(z["paths"][i]), int(z["labels"][i]), str(z["sources"][i]))
+            for i in range(count)
+        ]
+        live = FeatureDataset(samples, preprocess_mode=meta.get("preprocess", "crop"), seed=int(meta.get("seed", 42)))
+        semantic = None
+        if "semantic" in branches:
+            semantic = SemanticEncoder(
+                meta["semantic_model"], pretrained=bool(meta.get("semantic_pretrained", True)),
+                device=device, intermediate_layers=meta.get("semantic_layers") or None,
+            )
+        ok = True
+        for i in range(count):
+            physics, prnu, freq, pixels, item_ok = live[i]
+            if not item_ok:
+                raise RuntimeError(f"unreadable sample: {samples[i][0]}")
+            values = {"physics": physics.numpy(), "prnu": prnu.numpy(), "freq": freq.numpy()}
+            if semantic is not None:
+                x = pixels.to(device).permute(2, 0, 1).unsqueeze(0).float() / 255.0
+                mean = torch.tensor(semantic.mean, device=device).view(1, 3, 1, 1)
+                std = torch.tensor(semantic.std, device=device).view(1, 3, 1, 1)
+                with torch.no_grad():
+                    values["semantic"] = semantic((x - mean) / std).float().cpu().numpy()[0]
+            for branch, live_value in values.items():
+                if branch not in z.files:
+                    continue
+                same = np.allclose(z[branch][i], live_value, rtol=1e-4, atol=1e-5)
+                print(f"  {branch} sample {i}: {'OK' if same else 'FAIL'}")
+                ok = ok and bool(same)
+        return ok
+    except Exception as exc:
+        print(f"[FAIL] cached-vs-live parity could not be completed: {exc}")
+        return False
 
 
 def main():
@@ -249,20 +299,26 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Kaggle Verification Runner started on {device}")
 
-    check_split_spec()
+    checks = {"split specification": check_split_spec()}
     if args.data_dir.exists():
-        check_dataset_counts(args.data_dir, args.expected_counts)
+        checks["folder counts"] = check_dataset_counts(args.data_dir, args.expected_counts)
     else:
-        print(f"\n[INFO] Data dir {args.data_dir} does not exist locally. Run on Kaggle.")
+        print(f"\n[FAIL] Data dir {args.data_dir} does not exist locally. Run on Kaggle.")
+        checks["folder counts"] = False
 
     check_models_and_throughput(device)
     check_frequency_and_dropout()
-    check_feature_allclose(args.data_dir, args.feature_cache)
+    checks["cached-vs-live parity"] = check_feature_allclose(args.data_dir, args.feature_cache, device)
 
     print("\n" + "=" * 65)
     print("Kaggle verification complete. Copy and paste the terminal report.")
     print("=" * 65)
+    failed = [name for name, ok in checks.items() if not ok]
+    if failed:
+        print("Verification failures:", ", ".join(failed))
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

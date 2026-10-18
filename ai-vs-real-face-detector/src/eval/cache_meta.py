@@ -20,7 +20,24 @@ FEATURE_AFFECTING_KEYS = (
     "augment",
     "branches",
     "crop_size",
+    "max_train_images",
+    "subset_seed",
 )
+
+
+def normalise_branches(value: Any) -> list[str]:
+    """Return the cache branch contract as a stable list, accepting legacy strings."""
+    if value is None:
+        return []
+    values = value.split(",") if isinstance(value, str) else value
+    return sorted({str(item).strip() for item in values if str(item).strip()})
+
+
+def meta_values_equal(key: str, cached: Any, requested: Any) -> bool:
+    """Compare cache metadata while remaining compatible with old branch strings."""
+    if key == "branches":
+        return normalise_branches(cached) == normalise_branches(requested)
+    return cached == requested
 
 
 def load_cache_meta(cache_dir: str | Path) -> Dict[str, Any]:
@@ -46,6 +63,7 @@ def requested_meta_from_args(args: Any) -> Dict[str, Any]:
         "branches": "branches",
         "max_train_images": "max_train_images",
         "max_train_per_class": "max_train_per_class",
+        "subset_seed": "subset_seed",
     }
     for attr, key in mapping.items():
         if hasattr(args, attr) and getattr(args, attr) not in (None, ""):
@@ -91,7 +109,7 @@ def check_cache_meta(
         if key not in meta:
             mismatches.append(f"{key}: cache missing, requested {requested[key]!r}")
             continue
-        if meta[key] != requested[key]:
+        if not meta_values_equal(key, meta[key], requested[key]):
             mismatches.append(f"{key}: cache={meta[key]!r} requested={requested[key]!r}")
     if mismatches:
         raise RuntimeError(

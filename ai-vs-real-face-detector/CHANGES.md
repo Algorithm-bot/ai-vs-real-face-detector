@@ -233,3 +233,54 @@ $$\text{Time (hours)} = \frac{N_{\text{images}}}{3600 \times \min\left(\text{Thr
 | **CLIP ViT-L/14 (fp16, batch size 64)** | NVIDIA T4 / RTX | ~2.3 GB | ~35-45 img/s (~35-45 mins for 90k images) |
 | **Frequency Branch Extraction (CPU)** | 1 CPU Core | < 100 MB | ~16 img/s (vectorized NumPy) |
 | **Stacking Logistic Regression (DEV)** | CPU | < 500 MB | < 15 seconds |
+
+---
+
+## 6. Kaggle Cache and Training Follow-up
+
+### Notebook changes (`notebooks/kaggle_train.ipynb`)
+
+- The config keeps `MAX_TRAIN_IMAGES = 200_000` and has no `prnu_only` entry in `HPARAMS`.
+- The cache command explicitly uses `--max-train-images $MAX_TRAIN_IMAGES` and
+  `--branches semantic,physics,freq`. It asserts that `train.npz`, `val.npz`, and
+  `test.npz` exist, and that `meta.json` records both `max_train_images` and the
+  requested branch list.
+- Stage-1 (and the hybrid run) receive the same `--max-train-images` value, so
+  their local training subset agrees with the cache metadata.
+- `run_and_log` reads raw subprocess bytes (`text=False`), decodes complete CR/LF
+  delimited lines, limits intermediate tqdm updates to one per 30 seconds, mirrors
+  output to `/kaggle/working/train.log`, and forwards `HF_TOKEN`.
+- The verification invocation is
+  `python kaggle_verify.py --data-dir $KAGGLE_DATASET_MOUNT --feature-cache /kaggle/working/feature_cache_v2`.
+
+### Cache-rebuild estimates
+
+The complete cache covers train + val + test: 820,948 images without the cap and
+299,079 with `--max-train-images 200_000`. At 32 img/s this is approximately
+7.13 h and 2.60 h, respectively. `kaggle_verify.py` prints the measured CLIP
+rate as `R` img/s; use `N / (3600 * R)` for the machine-specific equivalent:
+820,948/(3600R) h without the cap and 299,079/(3600R) h with it. For example, a
+verifier result of 45 img/s gives 5.07 h and 1.85 h.
+
+### Physics and `--deep-no-down`
+
+`PHYSICS_FEATURE_DIM` remains 22. The feature-vector source now documents its
+first six scene-level optical cues: illumination uniformity, illumination-gradient
+magnitude, left/right brightness difference, top/bottom brightness difference,
+shadow coverage, and highlight coverage.
+
+The `--deep-no-down` message is no longer a fixed T4 estimate. After each
+train+validation epoch it measures the observed img/s rate, then estimates one
+pass over the actual `train + val + test` image total as
+`(N_train + N_val + N_test) / observed_img_per_second`.
+
+### Conditionally skipped end-to-end tests
+
+There are no literal `@pytest.mark.skip` decorators in the current `tests/`
+tree. The two end-to-end tests can instead be skipped through their shared
+fixtures:
+
+- `test_e2e_predict` — skipped when no image exists in `data/real` or
+  `data/fake`, or when `models/hybrid_best.pt` is absent.
+- `test_e2e_full_explainability` — skipped for the same missing sample-image or
+  missing-checkpoint conditions.

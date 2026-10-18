@@ -39,6 +39,7 @@ def _dev_dataset(data_dir: Path, checkpoint_args: dict, mode: str, feature_cache
         "use_physics": mode in {"hybrid", "full_hybrid", "physics_only"},
         "use_prnu": mode in {"full_hybrid", "prnu_only"},
         "use_semantic": mode in {"full_hybrid", "semantic_only", "clip_linear"},
+        "use_freq": mode == "freq_only" or "freq" in str(checkpoint_args.get("branches") or ""),
         "semantic_model": checkpoint_args.get("semantic_model", "vit_small_patch16_224"),
         "semantic_pretrained": checkpoint_args.get(
             "semantic_pretrained",

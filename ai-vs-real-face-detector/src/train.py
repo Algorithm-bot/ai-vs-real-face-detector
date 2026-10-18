@@ -434,7 +434,9 @@ def process_face_sample(
         else:
             if physics_extractor is None:
                 raise RuntimeError("Physics extractor is unavailable.")
-            physics_vec = physics_extractor.extract(processed_rgb).vector
+            # Use shared unresized center 224x224 crop for physics branch to ensure consistency with cached features.
+            from src.preprocess import preprocess_for_freq
+            physics_vec = physics_extractor.extract(preprocess_for_freq(rgb)).vector
     else:
         physics_vec = np.zeros(PHYSICS_FEATURE_DIM, dtype=np.float32)
 
@@ -524,6 +526,7 @@ class FaceBinaryDataset(Dataset):
         feature_cache_dir: Optional[str] = None,
         folder_filter: Optional[List[str]] = None,
         legacy_cache: bool = False,
+        cache_requested_meta: Optional[Dict[str, Any]] = None,
     ) -> None:
 
         if split not in {"train", "val", "test"}:
@@ -548,6 +551,7 @@ class FaceBinaryDataset(Dataset):
         self.transform = transform
         self.folder_filter = folder_filter
         self.legacy_cache = legacy_cache
+        self.cache_requested_meta = cache_requested_meta
         self._cache_row = None
         self._cache_arrays = None
         # Six direct directory checks only. Nested CNNDetection discovery is
@@ -1215,6 +1219,7 @@ def build_loaders(args, device: torch.device, folder_filter: Optional[List[str]]
             feature_cache_dir=args.feature_cache,
             folder_filter=folders,
             legacy_cache=bool(getattr(args, "legacy", False)),
+            cache_requested_meta=requested_meta_from_args(args),
             **common,
         )
 
@@ -1252,26 +1257,13 @@ def build_loaders(args, device: torch.device, folder_filter: Optional[List[str]]
     if not streaming and effective_cap > 0:
         before = len(train_ds.samples)
         train_ds.samples = subsample_balanced(
-            train_ds.samples, effective_cap, args.seed
+            train_ds.samples, effective_cap, args.subset_seed
         )
         print(f"Training subset: {before} -> {len(train_ds.samples)} images "
-              f"(max_train_images={getattr(args, 'max_train_images', 0)}, max {effective_cap} per class)")
+              f"(max_train_images={getattr(args, 'max_train_images', 0)}, "
+              f"max {effective_cap} per class, subset_seed={args.subset_seed})")
     elif streaming and effective_cap > 0:
         print("WARNING: --max-train-images / --max-train-per-class is ignored for hf-stream datasets.")
-
-    if getattr(args, "deep_no_down", False):
-        n_train = len(train_ds.samples) if hasattr(train_ds, "samples") else getattr(args, "known_train_size", 721869)
-        # Measured forward-only speed is ~35 img/s on T4; training (forward + backward + optimizer) is ~15-20 img/s
-        est_train_throughput = 18.0  # img/s
-        est_epoch_seconds = n_train / est_train_throughput
-        est_epoch_hours = est_epoch_seconds / 3600.0
-        print("\n" + "!" * 72)
-        print("WARNING: --deep-no-down is ENABLED (EfficientNet stem stride 1 instead of 2).")
-        print("  - VRAM usage will increase significantly (~4.7 GB vs ~1.2 GB).")
-        print(f"  - Training set size: {n_train:,} images.")
-        print(f"  - Forward-only throughput: ~35 img/s; full forward+backward training: ~{est_train_throughput:.0f} img/s on T4.")
-        print(f"  - Dynamic estimated training time per epoch: {est_epoch_hours:.2f} hours (~{est_epoch_seconds/60:.1f} minutes).")
-        print("!" * 72 + "\n")
 
     # --------------------------------------------------------
     # Validation dataset
@@ -1313,6 +1305,36 @@ def build_loaders(args, device: torch.device, folder_filter: Optional[List[str]]
         **_loader_extras(args),
     )
     return train_loader, val_loader, test_loader
+
+
+def report_deep_no_down_estimate(args, train_loader, val_loader, test_loader, elapsed_seconds):
+    """Report a whole-split estimate using the measured train+val image rate."""
+    if not getattr(args, "deep_no_down", False) or elapsed_seconds <= 0:
+        return
+
+    def split_size(loader, split_name):
+        try:
+            return len(loader.dataset)
+        except TypeError:
+            return int(getattr(args, f"known_{split_name}_size", 0))
+
+    split_sizes = [
+        split_size(train_loader, "train"),
+        split_size(val_loader, "val"),
+        split_size(test_loader, "test"),
+    ]
+    observed_images = split_sizes[0] + split_sizes[1]
+    if observed_images <= 0:
+        return
+    observed_rate = observed_images / elapsed_seconds
+    total_images = sum(split_sizes)
+    estimated_seconds = total_images / observed_rate
+    print("\n" + "!" * 72)
+    print("WARNING: --deep-no-down is ENABLED (EfficientNet stem stride 1 instead of 2).")
+    print("  - VRAM usage will increase significantly (~4.7 GB vs ~1.2 GB).")
+    print(f"  - Observed train+val rate: {observed_rate:.1f} img/s ({observed_images:,} images in {elapsed_seconds / 60:.1f} min).")
+    print(f"  - One pass over train+val+test ({total_images:,} images): ~{estimated_seconds / 60:.1f} min ({estimated_seconds / 3600:.2f} h).")
+    print("!" * 72 + "\n")
 
 
 # ============================================================
@@ -2134,6 +2156,8 @@ def run_stage1(
             args.epochs + 1,
         ):
 
+            epoch_started_at = time.perf_counter()
+
             train_metrics = train_epoch_stage1(
                 model,
                 train_loader,
@@ -2147,6 +2171,11 @@ def run_stage1(
                 val_loader,
                 criterion,
                 device,
+            )
+
+            report_deep_no_down_estimate(
+                args, train_loader, val_loader, test_loader,
+                time.perf_counter() - epoch_started_at,
             )
 
             scheduler.step()
@@ -2683,6 +2712,7 @@ def run_full_hybrid(args, device) -> None:
             print(
                 f"\nStarting Epoch {epoch}/{args.epochs}"
             )
+            epoch_started_at = time.perf_counter()
 
             epoch_start_batch = (
                 start_batch
@@ -2738,6 +2768,11 @@ def run_full_hybrid(args, device) -> None:
                 epoch,
                 args.epochs,
                 total_batches=_loader_batches(val_loader, args, "val"),
+            )
+
+            report_deep_no_down_estimate(
+                args, train_loader, val_loader, test_loader,
+                time.perf_counter() - epoch_started_at,
             )
 
             # Correct scheduler order: optimizer.step() happens inside the
@@ -3106,11 +3141,13 @@ def parse_args():
             "physics_only",
             "prnu_only",
             "semantic_only",
+            "freq_only",
+            "clip_linear",
         ],
         default="stage1",
         help=(
             "stage1 = deep branch only; "
-            "physics_only / prnu_only / semantic_only = single-branch MLPs; "
+            "physics_only / prnu_only / semantic_only / freq_only / clip_linear = single-branch MLPs; "
             "hybrid = deep + physics; "
             "full_hybrid = deep + physics + PRNU + ViT"
         ),
@@ -3304,6 +3341,12 @@ def parse_args():
         type=int,
         default=42,
     )
+    parser.add_argument(
+        "--subset-seed",
+        type=int,
+        default=42,
+        help="Random seed for balanced subset selection only; training seed controls initialization and ordering.",
+    )
 
     parser.add_argument(
         "--scaler-samples",
@@ -3447,17 +3490,6 @@ def main() -> None:
     print("Fresh start (ignore existing checkpoint):", args.fresh)
     print("Deep no-down (stem stride 1):", args.deep_no_down)
     print("=" * 60)
-
-    if getattr(args, "deep_no_down", False):
-        cap = getattr(args, "max_train_images", 0)
-        n_est = cap if cap > 0 else 721869
-        est_hrs = (n_est / 18.0) / 3600.0
-        print("\n" + "!" * 72)
-        print("WARNING: --deep-no-down is ENABLED (EfficientNet stem stride 1 instead of 2).")
-        print("  - VRAM usage will increase significantly (~4.7 GB vs ~1.2 GB).")
-        print("  - Forward throughput drops ~10x (~35 img/s vs ~385 img/s on NVIDIA T4).")
-        print(f"  - Training throughput (fwd+bwd) is ~18 img/s. Estimated epoch time for {n_est:,} images: ~{est_hrs:.1f} hours.")
-        print("!" * 72 + "\n")
 
     # --------------------------------------------------------
     # Run selected mode

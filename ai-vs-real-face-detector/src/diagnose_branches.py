@@ -154,8 +154,18 @@ def run_diagnostics_from_predictions(
     if len(df_rep) == 0:
         raise ValueError("No REPORT samples found in predictions CSV.")
 
-    branch_cols = [c for c in df.columns if c.startswith("p_ai_") and c != "p_ai_fused"]
-    branches = [c.replace("p_ai_", "") for c in branch_cols]
+    branch_cols = sorted(
+        c for c in df.columns
+        if c.startswith("p_ai__") and c != "p_ai__full_hybrid"
+    )
+    if not branch_cols:
+        branch_cols = [
+            c for c in df.columns
+            if c.startswith("p_ai_") and c != "p_ai_fused"
+        ]
+    branches = [
+        c.removeprefix("p_ai__").removeprefix("p_ai_") for c in branch_cols
+    ]
 
     report_sources = df_rep["folder"].astype(str).tolist()
     report_labels = df_rep["label"].astype(int).values
@@ -206,11 +216,14 @@ def main():
     parser = argparse.ArgumentParser(description="Branch diagnostic tool: evaluate per-branch AUC on REPORT folders.")
     parser.add_argument("--feature-cache", type=str, default="", help="Path to cache directory with test.npz")
     parser.add_argument("--predictions", type=str, default="", help="Path to per-image predictions CSV")
-    parser.add_argument("--splits", type=str, default="", help="Path to eval/splits.yaml")
+    parser.add_argument(
+        "--splits-yaml", "--splits", dest="splits_yaml", type=str, default="",
+        help="Path to eval/splits.yaml (--splits is retained as an alias)",
+    )
     parser.add_argument("--output", type=str, default="eval_out/branch_diagnostics.csv", help="Output CSV path")
     args = parser.parse_args()
 
-    splits_path = Path(args.splits) if args.splits else None
+    splits_path = Path(args.splits_yaml) if args.splits_yaml else None
 
     if args.predictions:
         df = run_diagnostics_from_predictions(Path(args.predictions), splits_path=splits_path)

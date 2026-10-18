@@ -51,7 +51,7 @@ def load_model(checkpoint_path: str, device: torch.device):
             freeze_blocks=args.get("freeze_blocks", 5),
             pretrained=False,
         )
-    elif mode in {"physics_only", "prnu_only", "semantic_only", "clip_linear"}:
+    elif mode in {"physics_only", "prnu_only", "semantic_only", "clip_linear", "freq_only"}:
         from src.prnu_branch.extractor import PRNU_FEATURE_DIM
         from src.physics_branch.feature_vector import PHYSICS_FEATURE_DIM
         dims = {
@@ -59,10 +59,11 @@ def load_model(checkpoint_path: str, device: torch.device):
             "prnu_only": args.get("prnu_dim", PRNU_FEATURE_DIM),
             "semantic_only": args.get("semantic_dim", 384),
             "clip_linear": args.get("semantic_dim", 768),
+            "freq_only": args.get("freq_dim", 64),
         }
         model = BranchOnlyClassifier(
             input_dim=int(dims[mode]),
-            normalize=mode in {"physics_only", "prnu_only"},
+            normalize=mode in {"physics_only", "prnu_only", "freq_only"},
             linear_probe=mode == "clip_linear",
         )
 
