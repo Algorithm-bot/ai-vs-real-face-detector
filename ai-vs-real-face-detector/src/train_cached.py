@@ -32,7 +32,13 @@ from src.features.feature_scalers import fit_physics_and_prnu_scalers
 from src.physics_branch.feature_vector import PHYSICS_FEATURE_DIM
 from src.prnu_branch.extractor import PRNU_FEATURE_DIM
 
-KEY = {"physics_only": "physics", "prnu_only": "prnu", "semantic_only": "semantic"}
+KEY = {
+    "physics_only": "physics",
+    "prnu_only": "prnu",
+    "semantic_only": "semantic",
+    "clip_linear": "semantic",
+}
+
 
 
 def load_split(cache_dir, split):
@@ -104,8 +110,12 @@ def main():
         physics_norm, prnu_norm = fit_physics_and_prnu_scalers([str(tr["paths"][i]) for i in rows])
         norm = physics_norm if mode == "physics_only" else prnu_norm
 
-    dims = {"physics_only": PHYSICS_FEATURE_DIM, "prnu_only": PRNU_FEATURE_DIM,
-            "semantic_only": args.semantic_dim}
+    dims = {
+        "physics_only": PHYSICS_FEATURE_DIM,
+        "prnu_only": PRNU_FEATURE_DIM,
+        "semantic_only": args.semantic_dim,
+        "clip_linear": args.semantic_dim,
+    }
 
     def prep(d, idx=None):
         X = d[key] if idx is None else d[key][idx]
@@ -123,7 +133,13 @@ def main():
     if Xtr.shape[1] != dims[mode]:
         sys.exit(f"Feature width {Xtr.shape[1]} != expected {dims[mode]} for {mode}")
 
-    model = BranchOnlyClassifier(input_dim=dims[mode], normalize=norm is not None).to(device)
+    is_linear = (mode == "clip_linear")
+    model = BranchOnlyClassifier(
+        input_dim=dims[mode],
+        normalize=norm is not None,
+        linear_probe=is_linear,
+    ).to(device)
+
     if mode == "physics_only":
         model.set_normalizer(physics_norm)
     elif mode == "prnu_only":

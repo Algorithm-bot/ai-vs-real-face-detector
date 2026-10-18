@@ -121,9 +121,9 @@ def process_split(split, samples, encoder, device, cache_dir, args):
         print(f"[{split}] already cached -> {final}")
         return
     shard_dir = cache_dir / f"{split}_shards"
-    shard_dir.mkdir(parents=True, exist_ok=True)
-    mean = torch.tensor(IMAGENET_MEAN, device=device).view(1, 3, 1, 1)
-    std = torch.tensor(IMAGENET_STD, device=device).view(1, 3, 1, 1)
+    batch_size = getattr(args, "batch_size", 64)
+    mean = torch.tensor(encoder.mean, device=device).view(1, 3, 1, 1)
+    std = torch.tensor(encoder.std, device=device).view(1, 3, 1, 1)
 
     n_shards = math.ceil(len(samples) / args.shard_size)
     for k in range(n_shards):
@@ -139,7 +139,7 @@ def process_split(split, samples, encoder, device, cache_dir, args):
                 enable_augment=enable_aug,
                 seed=args.seed,
             ),
-            batch_size=64, shuffle=False,
+            batch_size=batch_size, shuffle=False,
             num_workers=args.workers, pin_memory=True,
             prefetch_factor=4 if args.workers > 0 else None,
         )
@@ -148,9 +148,10 @@ def process_split(split, samples, encoder, device, cache_dir, args):
         for p, q, v, ok in tqdm(loader, desc=f"{split} shard {k + 1}/{n_shards}"):
             x = v.to(device, non_blocking=True).permute(0, 3, 1, 2).float() / 255.0
             x = (x - mean) / std
-            with torch.no_grad():
+            with torch.no_grad(), torch.autocast(device_type=device.type, dtype=torch.float16, enabled=(device.type == "cuda")):
                 s = encoder(x).float().cpu().numpy()
             phys.append(p.numpy()); prnu.append(q.numpy()); sem.append(s); oks.append(ok.numpy())
+
         tmp = shard_dir / f"{k:05d}.tmp.npz"
         np.savez(
             tmp,
@@ -188,6 +189,10 @@ def main():
     ap.add_argument("--workers", type=int, default=max((os.cpu_count() or 4) - 2, 1))
     ap.add_argument("--shard-size", type=int, default=20000)
     ap.add_argument("--semantic-model", default=DEFAULT_VIT_MODEL)
+    ap.add_argument("--semantic-layers", default=None,
+                    help="Optional comma-separated transformer block indices to extract CLS tokens from (e.g. 12,16,20,24)")
+    ap.add_argument("--batch-size", type=int, default=64,
+                    help="Batch size for GPU semantic encoder forward pass")
     ap.add_argument("--no-semantic-pretrained", action="store_true")
     ap.add_argument("--preprocess", choices=["crop", "resize"], default="crop",
                     help="crop = random crop on train, center crop on test; resize = legacy")
@@ -208,12 +213,14 @@ def main():
         model_name=args.semantic_model,
         pretrained=not args.no_semantic_pretrained,
         device=device,
+        intermediate_layers=args.semantic_layers,
     )
     encoder.eval()
 
     meta = {
         "semantic_model": args.semantic_model,
         "semantic_pretrained": not args.no_semantic_pretrained,
+        "semantic_layers": args.semantic_layers or "",
         "physics_dim": PHYSICS_FEATURE_DIM,
         "prnu_dim": PRNU_FEATURE_DIM,
         "semantic_dim": int(encoder.embedding_dim),
@@ -224,6 +231,7 @@ def main():
         "seed": args.seed,
     }
     (cache_dir / "meta.json").write_text(json.dumps(meta, indent=2))
+
 
 
     for split in args.splits:

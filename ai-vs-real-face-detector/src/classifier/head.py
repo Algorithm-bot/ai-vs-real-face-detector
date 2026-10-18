@@ -247,7 +247,7 @@ class FullHybridClassifier(nn.Module):
 
 
 class BranchOnlyClassifier(nn.Module):
-    """MLP on a single branch vector (physics, PRNU, or semantic)."""
+    """MLP or Linear Probe on a single branch vector (physics, PRNU, semantic, or freq)."""
 
     LABELS = ("real", "ai")
 
@@ -258,17 +258,24 @@ class BranchOnlyClassifier(nn.Module):
         dropout: float = 0.3,
         num_classes: int = 2,
         normalize: bool = False,
+        linear_probe: bool = False,
     ) -> None:
         super().__init__()
         self.input_dim = input_dim
         self.normalize = normalize
+        self.linear_probe = linear_probe
         self.normalizer = PhysicsNormalizer() if normalize else None
-        self.classifier = ClassificationHead(
-            input_dim=input_dim,
-            hidden_dims=hidden_dims,
-            dropout=dropout,
-            num_classes=num_classes,
-        )
+        if linear_probe:
+            # Item 3d: Linear probe evaluation mode (single linear layer with no hidden layers)
+            self.classifier = nn.Linear(input_dim, num_classes)
+        else:
+            self.classifier = ClassificationHead(
+                input_dim=input_dim,
+                hidden_dims=hidden_dims,
+                dropout=dropout,
+                num_classes=num_classes,
+            )
+
 
     def set_normalizer(self, normalizer: Optional[PhysicsNormalizer]) -> None:
         self.normalizer = normalizer

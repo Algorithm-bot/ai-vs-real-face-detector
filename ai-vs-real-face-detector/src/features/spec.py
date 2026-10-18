@@ -43,17 +43,17 @@ def semantic_dim_from_config(cfg: Mapping[str, Any]) -> int:
         return int(cfg["semantic_dim"])
     layers = cfg.get("semantic_layers") or ""
     model = str(cfg.get("semantic_model") or "vit_small_patch16_224")
-    if "vit_large_patch14_clip" in model or "ViT-L-14" in model:
-        per_layer = 768
-    elif "vit_small" in model:
-        per_layer = 384
-    else:
-        per_layer = int(cfg.get("semantic_dim") or 384)
     if layers:
         n_layers = len([p for p in str(layers).split(",") if p.strip()])
-        if n_layers:
-            return per_layer * n_layers
-    return per_layer
+        if "vit_large" in model or "ViT-L" in model:
+            return 1024 * n_layers
+        return 384 * n_layers
+    if "vit_large_patch14_clip" in model or "ViT-L-14" in model:
+        return 768
+    elif "vit_small" in model:
+        return 384
+    return int(cfg.get("semantic_dim") or 384)
+
 
 
 def freq_dim_from_config(cfg: Mapping[str, Any] | None = None) -> int:
