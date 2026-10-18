@@ -55,27 +55,26 @@ class GatedFusion(nn.Module):
 
     def apply_branch_dropout(self, modalities: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """
-        Item 5a: Branch dropout during training.
-        Each branch vector is zeroed with probability p (default 0.15).
-        Never drop ALL branches. Disabled at eval.
+        Item 5a: Branch dropout during training (p=0.15).
+        Randomly zero out each auxiliary branch's features independently,
+        keeping deep branch always active to prevent over-reliance on any single branch.
+        At eval time, all branches are active.
         """
-        if not self.training or self.branch_dropout <= 0.0 or len(self.modality_names) <= 1:
+        if not self.training or self.branch_dropout <= 0.0:
             return modalities
 
-        n = len(self.modality_names)
-        # Generate drop mask: True if kept, False if dropped
-        drop_mask = [random.random() >= self.branch_dropout for _ in range(n)]
-        # If all branches were dropped, keep at least one randomly
-        if not any(drop_mask):
-            keep_idx = random.randint(0, n - 1)
-            drop_mask[keep_idx] = True
-
         out = {}
-        for (name, feat), kept in zip(modalities.items(), drop_mask):
-            if kept:
+        for name, feat in modalities.items():
+            if name == "deep":
+                # Deep branch is always active
                 out[name] = feat
             else:
-                out[name] = torch.zeros_like(feat)
+                # Auxiliary branch: zero out independently with probability p
+                bs = feat.size(0) if feat.dim() > 1 else 1
+                keep_mask = (torch.rand(bs, 1, device=feat.device) >= self.branch_dropout).float()
+                if feat.dim() == 1:
+                    keep_mask = keep_mask.squeeze(1)
+                out[name] = feat * keep_mask
         return out
 
     def forward(self, modalities: Dict[str, torch.Tensor]) -> torch.Tensor:

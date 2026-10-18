@@ -89,11 +89,13 @@ def predict_loader(
                 physics = batch["physics"].to(device)
                 prnu = batch.get("prnu")
                 semantic = batch.get("semantic")
+                freq = batch.get("freq")
                 weights = model.get_fusion_weights(
                     batch["image"].to(device),
                     physics,
                     prnu.to(device) if prnu is not None else None,
                     semantic.to(device) if semantic is not None else None,
+                    freq_features=freq.to(device) if freq is not None else None,
                 )
                 for name, value in weights.items():
                     gate_sums[name] = gate_sums.get(name, 0.0) + float(value) * n

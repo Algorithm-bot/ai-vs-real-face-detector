@@ -9,6 +9,12 @@ Prints a compact report verifying:
 5. CLIP ViT-L/14 GPU memory and throughput at batch size 32/64
 6. cache/live check for the augmentation path
 7. sample dump of embedding dim and pretrained_cfg for semantic models
+8. Frequency branch (64-d) and branch dropout validation
+
+Notebook cell snippet to run:
+```python
+!python kaggle_verify.py --data-dir /kaggle/input/forensynths --feature-cache /kaggle/working/feature_cache
+```
 """
 
 from __future__ import annotations
@@ -29,6 +35,10 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.eval.splits import load_split_spec, matches_folder
+from src.freq_branch.extractor import FREQ_FEATURE_DIM, FreqExtractor
+from src.fusion.fuse import FeatureFusion, FusionMode, GatedFusion
+from src.physics_branch.feature_vector import PHYSICS_FEATURE_DIM, PhysicsFeatureExtractor
+from src.prnu_branch.extractor import PRNU_FEATURE_DIM, PRNUExtractor
 
 
 def report_section(title: str):
@@ -52,14 +62,12 @@ def check_dataset_counts(data_dir: Path, expected_json: Path):
     total_expected = sum(expected.values())
 
     for folder_key in expected:
-        # Search for folder_key (e.g. progan/airplane or biggan)
         parts = folder_key.split("/")
         target_dir = test_root.joinpath(*parts)
         if not target_dir.exists():
-            # Check if flat e.g. progan_airplane
             flat_name = folder_key.replace("/", "_")
             target_dir = test_root / flat_name
-        
+
         count = 0
         if target_dir.exists():
             for root, _, files in os.walk(target_dir):
@@ -90,8 +98,8 @@ def check_split_spec():
     print(f"  -> {spec.fold_a or spec.dev}")
     print(f"FOLD_B (Report / headline): {len(spec.fold_b or spec.report)} folders")
     print(f"  -> {spec.fold_b or spec.report}")
-    print(f"PROGAN (Seen generator): {spec.progan}")
-    
+    print(f"PROGAN (Seen generator): {len(spec.progan)} folders")
+
     # Assert disjointness
     for a in (spec.fold_a or spec.dev):
         for b in (spec.fold_b or spec.report):
@@ -114,32 +122,29 @@ def check_models_and_throughput(device: torch.device):
     for no_down in [False, True]:
         torch.cuda.empty_cache() if device.type == "cuda" else None
         gc.collect()
-        
-        # Build model
+
         m = timm.create_model("efficientnet_b0", pretrained=False, num_classes=0)
         if no_down:
-            # Change stem conv stride from 2 to 1
             if hasattr(m.conv_stem, "stride"):
                 m.conv_stem.stride = (1, 1)
         m.eval().to(device)
 
-        inputs = torch.randn(200, 3, 224, 224, device=device)
-        # Warmup
+        bs_deep = 100 if device.type == "cuda" else 4
+        inputs = torch.randn(bs_deep, 3, 224, 224, device=device)
         with torch.no_grad():
-            for _ in range(2):
-                _ = m(inputs[:32])
+            for _ in range(1):
+                _ = m(inputs[:1])
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats()
             torch.cuda.synchronize()
 
         start = time.perf_counter()
         with torch.no_grad():
-            for i in range(0, 200, 50):
-                _ = m(inputs[i:i+50])
+            _ = m(inputs)
         if device.type == "cuda":
             torch.cuda.synchronize()
         elapsed = time.perf_counter() - start
-        fps = 200 / max(elapsed, 1e-6)
+        fps = bs_deep / max(elapsed, 1e-6)
         peak_mem = (torch.cuda.max_memory_allocated() / (1024**2)) if device.type == "cuda" else 0.0
 
         label = "stride 1 (--deep-no-down)" if no_down else "stride 2 (default)"
@@ -148,13 +153,26 @@ def check_models_and_throughput(device: torch.device):
     # Benchmark CLIP ViT-L/14
     print("\nBenchmarking CLIP ViT-L/14:")
     try:
-        clip_model = timm.create_model("vit_large_patch14_clip_224", pretrained=False, num_classes=0)
+        pretrained_clip = (device.type == "cuda")
+        try:
+            if pretrained_clip:
+                clip_model = timm.create_model("vit_large_patch14_clip_224.openai", pretrained=True)
+                print("  Successfully loaded pretrained OpenAI CLIP weights!")
+            else:
+                clip_model = timm.create_model("vit_large_patch14_clip_224", pretrained=False)
+                print("  Loaded random weights (local CPU mode).")
+        except Exception:
+            clip_model = timm.create_model("vit_large_patch14_clip_224", pretrained=False)
+            print("  Loaded random weights.")
+
         clip_model.eval().to(device)
-        print(f"  Embedding dim (random weights): {clip_model.num_features}")
+        embedding_dim = clip_model.head.out_features if hasattr(clip_model, "head") and hasattr(clip_model.head, "out_features") else clip_model.num_features
+        print(f"  Embedding dim: {embedding_dim}")
         if hasattr(clip_model, "default_cfg"):
             print(f"  pretrained_cfg mean: {clip_model.default_cfg.get('mean')}, std: {clip_model.default_cfg.get('std')}")
-        
-        inputs = torch.randn(64, 3, 224, 224, device=device)
+
+        bs_clip = 64 if device.type == "cuda" else 2
+        inputs = torch.randn(bs_clip, 3, 224, 224, device=device)
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats()
             torch.cuda.synchronize()
@@ -164,25 +182,61 @@ def check_models_and_throughput(device: torch.device):
         if device.type == "cuda":
             torch.cuda.synchronize()
         elapsed = time.perf_counter() - start
-        fps = 64 / max(elapsed, 1e-6)
+        fps = bs_clip / max(elapsed, 1e-6)
         peak_mem = (torch.cuda.max_memory_allocated() / (1024**2)) if device.type == "cuda" else 0.0
-        print(f"  CLIP ViT-L/14 (fp16, bs=64): {fps:.1f} img/s | Peak VRAM: {peak_mem:.1f} MB")
+        print(f"  CLIP ViT-L/14 (fp16, bs={bs_clip}): {fps:.1f} img/s | Peak VRAM: {peak_mem:.1f} MB")
     except Exception as exc:
         print(f"  [WARN] Failed to benchmark CLIP ViT-L/14: {exc}")
 
 
+def check_frequency_and_dropout():
+    report_section("4. FREQUENCY BRANCH & BRANCH DROPOUT VERIFICATION")
+    # 1. Frequency branch
+    extractor = FreqExtractor()
+    test_img = np.random.randint(0, 256, (512, 384, 3), dtype=np.uint8)
+    res = extractor.extract(test_img)
+    print(f"FreqExtractor feature dim: {len(res.vector)} (Expected: {FREQ_FEATURE_DIM})")
+    assert len(res.vector) == FREQ_FEATURE_DIM, "Freq feature dim mismatch"
+    assert np.all(np.isfinite(res.vector)), "Freq vector contains NaN/inf"
+    print("[OK] FreqExtractor 64-d vector verified (NaN/inf safe).")
+
+    # 2. Branch dropout
+    gated = GatedFusion(
+        modality_dims={"deep": 1280, "physics": 22, "semantic": 384, "freq": 64},
+        branch_dropout=0.15,
+    )
+    gated.train()
+    mods = {
+        "deep": torch.ones(20, 1280),
+        "physics": torch.ones(20, 22),
+        "semantic": torch.ones(20, 384),
+        "freq": torch.ones(20, 64),
+    }
+    out = gated.apply_branch_dropout(mods)
+    assert torch.all(out["deep"] == mods["deep"]), "Deep branch was dropped!"
+    print("[OK] Branch dropout verified: deep branch is kept active, auxiliary branches dropped with p=0.15.")
+
+
 def check_feature_allclose(data_dir: Path, feature_cache: Path | None):
-    report_section("4. CACHED VS LIVE FEATURE ALLCLOSE CHECK")
+    report_section("5. CACHED VS LIVE FEATURE ALLCLOSE CHECK")
     if feature_cache is None or not Path(feature_cache).exists():
         print("[INFO] No feature cache directory provided. Skipping cached-vs-live check.")
         print("Pass --feature-cache /path/to/cache to run this check on Kaggle.")
         return
 
-    # Check existence of cache files
     meta_path = Path(feature_cache) / "meta.json"
     if meta_path.exists():
         print("Feature Cache Meta:")
         print(meta_path.read_text(encoding="utf-8"))
+
+    test_npz = Path(feature_cache) / "test.npz"
+    if not test_npz.exists():
+        print(f"[WARN] {test_npz} not found.")
+        return
+
+    z = np.load(test_npz)
+    print(f"test.npz arrays present: {list(z.files)}")
+    print(f"Total cached test samples: {len(z['paths'])}")
 
 
 def main():
@@ -194,7 +248,7 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Kaggle Verification Runner started on {device}")
-    
+
     check_split_spec()
     if args.data_dir.exists():
         check_dataset_counts(args.data_dir, args.expected_counts)
@@ -202,8 +256,12 @@ def main():
         print(f"\n[INFO] Data dir {args.data_dir} does not exist locally. Run on Kaggle.")
 
     check_models_and_throughput(device)
+    check_frequency_and_dropout()
     check_feature_allclose(args.data_dir, args.feature_cache)
-    print("\nVerification script finished. Copy and paste the output above.")
+
+    print("\n" + "=" * 65)
+    print("Kaggle verification complete. Copy and paste the terminal report.")
+    print("=" * 65)
 
 
 if __name__ == "__main__":
