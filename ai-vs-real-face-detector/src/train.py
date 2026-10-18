@@ -468,7 +468,8 @@ def process_face_sample(
             freq_vec = cached["freq"]
         else:
             from src.freq_branch.extractor import FreqExtractor
-            freq_vec = np.asarray(FreqExtractor().extract(rgb).vector, dtype=np.float32)
+            from src.preprocess import preprocess_for_freq
+            freq_vec = np.asarray(FreqExtractor().extract(preprocess_for_freq(rgb)).vector, dtype=np.float32)
         sample["freq"] = torch.from_numpy(np.asarray(freq_vec, dtype=np.float32))
     return sample
 
@@ -1178,10 +1179,15 @@ def build_loaders(args, device: torch.device, folder_filter: Optional[List[str]]
     dataset_discovery_seconds = 0.0
 
     def make_dataset(split_name: str, transform, folders=None):
+        branches_str = getattr(args, "branches", "deep,physics,semantic,freq")
+        if getattr(args, "legacy", False) and getattr(args, "branches", None) is None:
+            branches_str = "deep,physics,prnu,semantic"
+        branch_set = {b.strip().lower() for b in branches_str.split(",")} if isinstance(branches_str, str) else set(branches_str)
         common = dict(
-            use_physics=args.mode in PHYSICS_MODES,
-            use_prnu=args.mode in PRNU_MODES,
-            use_semantic=args.mode in SEMANTIC_MODES,
+            use_physics="physics" in branch_set if args.mode == "full_hybrid" else (args.mode in PHYSICS_MODES),
+            use_prnu="prnu" in branch_set if args.mode == "full_hybrid" else (args.mode in PRNU_MODES),
+            use_semantic="semantic" in branch_set if args.mode == "full_hybrid" else (args.mode in SEMANTIC_MODES),
+            use_freq="freq" in branch_set if args.mode == "full_hybrid" else (args.mode == "freq_only"),
             semantic_model=args.semantic_model,
             semantic_pretrained=not args.no_semantic_pretrained,
             preprocessor=preprocessor,
@@ -2500,7 +2506,10 @@ def run_full_hybrid(args, device) -> None:
     # ------------------------------------------------------------
     # Create model
     # ------------------------------------------------------------
-    print("[3/5] Creating model")
+    branches_str = getattr(args, "branches", "deep,physics,semantic,freq")
+    if getattr(args, "legacy", False) and getattr(args, "branches", None) is None:
+        branches_str = "deep,physics,prnu,semantic"
+    branches_list = [b.strip().lower() for b in branches_str.split(",") if b.strip()]
     model = FullHybridClassifier(
         model_name=args.backbone,
         semantic_model=args.semantic_model,
@@ -2511,6 +2520,9 @@ def run_full_hybrid(args, device) -> None:
         fusion_mode=FusionMode(args.fusion_mode),
         normalize_physics=True,
         normalize_prnu=True,
+        branches=branches_list,
+        no_down=getattr(args, "deep_no_down", False),
+        branch_dropout=getattr(args, "branch_dropout", 0.0),
     ).to(device)
 
     model.set_feature_scalers(
@@ -3202,6 +3214,24 @@ def parse_args():
         action="store_true",
         default=False,
         help="Set EfficientNet-B0 stem conv stride from 2 to 1",
+    )
+    parser.add_argument(
+        "--branches",
+        type=str,
+        default="deep,physics,semantic,freq",
+        help="Comma-separated branches to use (default: deep,physics,semantic,freq; prnu is off by default)",
+    )
+    parser.add_argument(
+        "--branch-dropout",
+        type=float,
+        default=0.15,
+        help="Probability of dropping auxiliary branches during training (default: 0.15)",
+    )
+    parser.add_argument(
+        "--legacy",
+        action="store_true",
+        default=False,
+        help="Enable legacy evaluation and training behavior",
     )
     parser.add_argument(
         "--batch-size",

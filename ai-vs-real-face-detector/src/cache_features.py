@@ -67,17 +67,20 @@ class FeatureDataset(Dataset):
         self.seed = seed
         self.physics = None
         self.prnu = None
+        self.freq = None
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, i):
         from src.augment import augment_raw_image
+        from src.freq_branch.extractor import FREQ_FEATURE_DIM, FreqExtractor
         from src.preprocess import PreprocessPipeline
 
         if self.physics is None:  # built lazily so each worker owns its extractors
             self.physics = PhysicsFeatureExtractor()
             self.prnu = PRNUExtractor()
+            self.freq = FreqExtractor()
         path = self.samples[i][0]
         try:
             bgr = cv2.imread(path)
@@ -103,15 +106,19 @@ class FeatureDataset(Dataset):
 
             p = np.asarray(self.physics.extract(processed_rgb).vector, dtype=np.float32)
             q = np.asarray(self.prnu.extract(processed_rgb).vector, dtype=np.float32)
+            from src.preprocess import preprocess_for_freq
+            f = np.asarray(self.freq.extract(preprocess_for_freq(rgb)).vector, dtype=np.float32)
             v = processed_rgb  # 224x224x3 uint8 passed to ViT/CLIP
             ok = 1
         except Exception as exc:  # keep a long job alive; bad images are dropped later
             print(f"\n[skip] {path}: {exc}", flush=True)
             p = np.zeros(PHYSICS_FEATURE_DIM, dtype=np.float32)
             q = np.zeros(PRNU_FEATURE_DIM, dtype=np.float32)
+            f = np.zeros(FREQ_FEATURE_DIM, dtype=np.float32)
             v = np.zeros((self.crop_size, self.crop_size, 3), dtype=np.uint8)
             ok = 0
-        return torch.from_numpy(p), torch.from_numpy(q), torch.from_numpy(v), ok
+        return torch.from_numpy(p), torch.from_numpy(q), torch.from_numpy(f), torch.from_numpy(v), ok
+
 
 
 
@@ -144,13 +151,13 @@ def process_split(split, samples, encoder, device, cache_dir, args):
             prefetch_factor=4 if args.workers > 0 else None,
         )
 
-        phys, prnu, sem, oks = [], [], [], []
-        for p, q, v, ok in tqdm(loader, desc=f"{split} shard {k + 1}/{n_shards}"):
+        phys, prnu, freqs, sem, oks = [], [], [], [], []
+        for p, q, f, v, ok in tqdm(loader, desc=f"{split} shard {k + 1}/{n_shards}"):
             x = v.to(device, non_blocking=True).permute(0, 3, 1, 2).float() / 255.0
             x = (x - mean) / std
             with torch.no_grad(), torch.autocast(device_type=device.type, dtype=torch.float16, enabled=(device.type == "cuda")):
                 s = encoder(x).float().cpu().numpy()
-            phys.append(p.numpy()); prnu.append(q.numpy()); sem.append(s); oks.append(ok.numpy())
+            phys.append(p.numpy()); prnu.append(q.numpy()); freqs.append(f.numpy()); sem.append(s); oks.append(ok.numpy())
 
         tmp = shard_dir / f"{k:05d}.tmp.npz"
         np.savez(
@@ -159,6 +166,7 @@ def process_split(split, samples, encoder, device, cache_dir, args):
             labels=np.array([s[1] for s in chunk], dtype=np.int8),
             sources=np.array([s[2] for s in chunk]),
             physics=np.concatenate(phys), prnu=np.concatenate(prnu),
+            freq=np.concatenate(freqs),
             semantic=np.concatenate(sem), ok=np.concatenate(oks).astype(bool),
         )
         os.replace(tmp, shard)
@@ -168,15 +176,17 @@ def process_split(split, samples, encoder, device, cache_dir, args):
     keep = merged.pop("ok")
     dropped = int((~keep).sum())
     merged = {key: val[keep] for key, val in merged.items()}
-    for key in ("physics", "prnu", "semantic"):
-        bad = ~np.isfinite(merged[key])
-        if bad.any():
-            rows = int(bad.any(axis=1).sum())
-            print(f"[{split}] WARNING: {rows} rows had NaN/inf in '{key}'; replaced with 0")
-            merged[key] = np.nan_to_num(merged[key], nan=0.0, posinf=0.0, neginf=0.0)
+    for key in ("physics", "prnu", "freq", "semantic"):
+        if key in merged:
+            bad = ~np.isfinite(merged[key])
+            if bad.any():
+                rows = int(bad.any(axis=1).sum())
+                print(f"[{split}] WARNING: {rows} rows had NaN/inf in '{key}'; replaced with 0")
+                merged[key] = np.nan_to_num(merged[key], nan=0.0, posinf=0.0, neginf=0.0)
     tmp_final = cache_dir / f"{split}.tmp.npz"
     np.savez(tmp_final, **merged)
     os.replace(tmp_final, final)
+
     print(f"[{split}] saved {len(merged['labels'])} rows (dropped {dropped} unreadable) -> {final}")
 
 
@@ -217,12 +227,15 @@ def main():
     )
     encoder.eval()
 
+    from src.freq_branch.extractor import FREQ_FEATURE_DIM
+
     meta = {
         "semantic_model": args.semantic_model,
         "semantic_pretrained": not args.no_semantic_pretrained,
         "semantic_layers": args.semantic_layers or "",
         "physics_dim": PHYSICS_FEATURE_DIM,
         "prnu_dim": PRNU_FEATURE_DIM,
+        "freq_dim": FREQ_FEATURE_DIM,
         "semantic_dim": int(encoder.embedding_dim),
         "max_train_per_class": args.max_train_per_class,
         "preprocess": args.preprocess,
@@ -231,6 +244,7 @@ def main():
         "seed": args.seed,
     }
     (cache_dir / "meta.json").write_text(json.dumps(meta, indent=2))
+
 
 
 

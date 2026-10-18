@@ -1,9 +1,10 @@
-"""Multi-modal feature fusion: concatenation, gated, and attention fusion."""
+"""Multi-modal feature fusion: concatenation, gated, attention, and branch dropout."""
 
 from __future__ import annotations
 
+import random
 from enum import Enum
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Sequence, Union
 
 import numpy as np
 import torch
@@ -31,9 +32,14 @@ def concatenate_features(
 
 
 class GatedFusion(nn.Module):
-    """Learned gating fusion across modality vectors."""
+    """Learned gating fusion across modality vectors with optional branch dropout."""
 
-    def __init__(self, modality_dims: Dict[str, int], hidden_dim: int = 64) -> None:
+    def __init__(
+        self,
+        modality_dims: Dict[str, int],
+        hidden_dim: int = 64,
+        branch_dropout: float = 0.0,
+    ) -> None:
         super().__init__()
         self.modality_names = list(modality_dims.keys())
         total = sum(modality_dims.values())
@@ -44,23 +50,52 @@ class GatedFusion(nn.Module):
             nn.Sigmoid(),
         )
         self.modality_dims = modality_dims
+        self.branch_dropout = branch_dropout
+        self._last_gates: Optional[torch.Tensor] = None
+
+    def apply_branch_dropout(self, modalities: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """
+        Item 5a: Branch dropout during training.
+        Each branch vector is zeroed with probability p (default 0.15).
+        Never drop ALL branches. Disabled at eval.
+        """
+        if not self.training or self.branch_dropout <= 0.0 or len(self.modality_names) <= 1:
+            return modalities
+
+        n = len(self.modality_names)
+        # Generate drop mask: True if kept, False if dropped
+        drop_mask = [random.random() >= self.branch_dropout for _ in range(n)]
+        # If all branches were dropped, keep at least one randomly
+        if not any(drop_mask):
+            keep_idx = random.randint(0, n - 1)
+            drop_mask[keep_idx] = True
+
+        out = {}
+        for (name, feat), kept in zip(modalities.items(), drop_mask):
+            if kept:
+                out[name] = feat
+            else:
+                out[name] = torch.zeros_like(feat)
+        return out
 
     def forward(self, modalities: Dict[str, torch.Tensor]) -> torch.Tensor:
+        # Apply branch dropout during training
+        active_modalities = self.apply_branch_dropout(modalities)
+
         parts = []
         for name in self.modality_names:
-            feat = modalities[name].float()
+            feat = active_modalities[name].float()
             if feat.dim() == 1:
                 feat = feat.unsqueeze(0)
             parts.append(feat)
         concat = torch.cat(parts, dim=1)
         gates = self.gate(concat)
+        self._last_gates = gates
+
         gated_parts = []
-        offset = 0
         for i, name in enumerate(self.modality_names):
-            dim = self.modality_dims[name]
             g = gates[:, i].unsqueeze(1)
             gated_parts.append(parts[i] * g)
-            offset += dim
         return torch.cat(gated_parts, dim=1)
 
     def get_gate_weights(self, modalities: Dict[str, torch.Tensor]) -> Dict[str, float]:
@@ -71,8 +106,9 @@ class GatedFusion(nn.Module):
                 feat = feat.unsqueeze(0)
             parts.append(feat)
         concat = torch.cat(parts, dim=1)
-        gates = self.gate(concat)[0].cpu().numpy()
-        return {name: float(gates[i]) for i, name in enumerate(self.modality_names)}
+        gates = self.gate(concat).detach()
+        mean_gates = gates.mean(dim=0).cpu().numpy()
+        return {name: float(mean_gates[i]) for i, name in enumerate(self.modality_names)}
 
 
 class AttentionFusion(nn.Module):
@@ -100,7 +136,6 @@ class AttentionFusion(nn.Module):
             if feat.dim() == 1:
                 feat = feat.unsqueeze(0)
             projected.append(self.projections[name](feat))
-        # Stack modalities as sequence: (batch, num_modalities, embed_dim)
         seq = torch.stack(projected, dim=1)
         attn_out, attn_weights = self.attention(seq, seq, seq)
         self._last_attn_weights = attn_weights
@@ -126,6 +161,7 @@ class FeatureFusion(nn.Module):
         self,
         mode: FusionMode = FusionMode.CONCAT,
         modality_dims: Optional[Dict[str, int]] = None,
+        branch_dropout: float = 0.0,
     ) -> None:
         super().__init__()
         self.mode = mode
@@ -134,26 +170,44 @@ class FeatureFusion(nn.Module):
         self._attention: Optional[AttentionFusion] = None
 
         if mode == FusionMode.GATED and modality_dims:
-            self._gated = GatedFusion(modality_dims)
+            self._gated = GatedFusion(modality_dims, branch_dropout=branch_dropout)
         elif mode == FusionMode.ATTENTION and modality_dims:
             self._attention = AttentionFusion(modality_dims)
 
     def fuse(
         self,
-        deep_features: torch.Tensor,
-        physics_features: torch.Tensor,
+        deep_features: Optional[torch.Tensor] = None,
+        physics_features: Optional[torch.Tensor] = None,
         prnu_features: Optional[torch.Tensor] = None,
         semantic_features: Optional[torch.Tensor] = None,
+        freq_features: Optional[torch.Tensor] = None,
+        **extra_modalities: torch.Tensor,
     ) -> torch.Tensor:
-        """Backward-compatible fuse for deep + physics; extended for all modalities."""
-        modalities: Dict[str, torch.Tensor] = {
-            "deep": deep_features,
-            "physics": physics_features,
-        }
-        if prnu_features is not None:
-            modalities["prnu"] = prnu_features
-        if semantic_features is not None:
-            modalities["semantic"] = semantic_features
+        deep = deep_features if deep_features is not None else extra_modalities.get("deep")
+        physics = physics_features if physics_features is not None else extra_modalities.get("physics")
+        prnu = prnu_features if prnu_features is not None else extra_modalities.get("prnu")
+        semantic = semantic_features if semantic_features is not None else extra_modalities.get("semantic")
+        freq = freq_features if freq_features is not None else extra_modalities.get("freq")
+
+        modalities: Dict[str, torch.Tensor] = {}
+        if deep is not None:
+            modalities["deep"] = deep
+        if physics is not None:
+            modalities["physics"] = physics
+        if prnu is not None:
+            modalities["prnu"] = prnu
+        if semantic is not None:
+            modalities["semantic"] = semantic
+        if freq is not None:
+            modalities["freq"] = freq
+
+        for k, v in extra_modalities.items():
+            if k not in modalities and k not in {"deep", "physics", "prnu", "semantic", "freq"}:
+                modalities[k] = v
+
+        # Filter to configured modalities if specified
+        if self.modality_dims:
+            modalities = {k: modalities[k] for k in self.modality_dims if k in modalities}
 
         if self.mode == FusionMode.CONCAT:
             return concatenate_features(*modalities.values())
@@ -168,19 +222,34 @@ class FeatureFusion(nn.Module):
 
     def get_fusion_weights(
         self,
-        deep_features: torch.Tensor,
-        physics_features: torch.Tensor,
+        deep_features: Optional[torch.Tensor] = None,
+        physics_features: Optional[torch.Tensor] = None,
         prnu_features: Optional[torch.Tensor] = None,
         semantic_features: Optional[torch.Tensor] = None,
+        freq_features: Optional[torch.Tensor] = None,
+        **extra_modalities: torch.Tensor,
     ) -> Dict[str, float]:
-        modalities: Dict[str, torch.Tensor] = {
-            "deep": deep_features,
-            "physics": physics_features,
-        }
-        if prnu_features is not None:
-            modalities["prnu"] = prnu_features
-        if semantic_features is not None:
-            modalities["semantic"] = semantic_features
+        deep = deep_features if deep_features is not None else extra_modalities.get("deep")
+        physics = physics_features if physics_features is not None else extra_modalities.get("physics")
+        prnu = prnu_features if prnu_features is not None else extra_modalities.get("prnu")
+        semantic = semantic_features if semantic_features is not None else extra_modalities.get("semantic")
+        freq = freq_features if freq_features is not None else extra_modalities.get("freq")
+
+        modalities: Dict[str, torch.Tensor] = {}
+        if deep is not None:
+            modalities["deep"] = deep
+        if physics is not None:
+            modalities["physics"] = physics
+        if prnu is not None:
+            modalities["prnu"] = prnu
+        if semantic is not None:
+            modalities["semantic"] = semantic
+        for k, v in extra_modalities.items():
+            if k not in modalities and k not in {"deep", "physics", "prnu", "semantic", "freq"}:
+                modalities[k] = v
+
+        if self.modality_dims:
+            modalities = {k: modalities[k] for k in self.modality_dims if k in modalities}
 
         if self.mode == FusionMode.GATED and self._gated is not None:
             return self._gated.get_gate_weights(modalities)
@@ -191,21 +260,21 @@ class FeatureFusion(nn.Module):
             if attn:
                 return {k: float(np.mean(list(v.values()))) for k, v in attn.items()}
 
-        # Concat mode: equal weighting
-        n = len(modalities)
+        n = max(len(modalities), 1)
         return {k: 1.0 / n for k in modalities}
 
     @staticmethod
     def output_dim(
         deep_dim: int,
-        physics_dim: int,
+        physics_dim: int = 0,
         prnu_dim: int = 0,
         semantic_dim: int = 0,
+        freq_dim: int = 0,
         mode: FusionMode = FusionMode.CONCAT,
         embed_dim: int = 128,
         num_modalities: int = 2,
     ) -> int:
-        total = deep_dim + physics_dim + prnu_dim + semantic_dim
+        total = deep_dim + physics_dim + prnu_dim + semantic_dim + freq_dim
         if mode == FusionMode.CONCAT:
             return total
         if mode == FusionMode.GATED:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Dict, Optional, Tuple
 
+import numpy as np
 import torch
 import torch.nn as nn
 
@@ -131,47 +132,63 @@ class FullHybridClassifier(nn.Module):
         physics_dim: int = PHYSICS_FEATURE_DIM,
         prnu_dim: int = PRNU_FEATURE_DIM,
         semantic_dim: int = 384,
+        freq_dim: int = 64,
+        branches: Optional[Sequence[str]] = None,
         fusion_mode: FusionMode = FusionMode.CONCAT,
+        branch_dropout: float = 0.0,
         hidden_dims: Tuple[int, ...] = (512, 256, 128),
         dropout: float = 0.3,
         num_classes: int = 2,
         normalize_physics: bool = True,
         normalize_prnu: bool = True,
+        no_down: bool = False,
     ) -> None:
         super().__init__()
+        from src.features.spec import parse_branches, DEFAULT_BRANCHES
+        self.branch_names = parse_branches(branches) if branches is not None else list(DEFAULT_BRANCHES)
         self.semantic_model = semantic_model
         self.semantic_pretrained = semantic_pretrained
         self.feature_extractor = DeepFeatureExtractor(
             model_name=model_name,
             pretrained=pretrained,
             freeze_blocks=freeze_blocks,
+            no_down=no_down,
         )
         self.deep_dim = self.feature_extractor.embedding_dim
         self.physics_dim = physics_dim
         self.prnu_dim = prnu_dim
         self.semantic_dim = semantic_dim
+        self.freq_dim = freq_dim
         self.fusion_mode = fusion_mode
         self.normalize_physics = normalize_physics
         self.normalize_prnu = normalize_prnu
         self.physics_normalizer = PhysicsNormalizer() if normalize_physics else None
-        self.prnu_normalizer = PhysicsNormalizer() if normalize_prnu else None
+        self.prnu_normalizer = (
+            PhysicsNormalizer(
+                mean=np.zeros(prnu_dim, dtype=np.float32),
+                std=np.ones(prnu_dim, dtype=np.float32),
+                feature_names=[f"prnu_{i}" for i in range(prnu_dim)],
+            )
+            if normalize_prnu
+            else None
+        )
 
-        modality_dims = {
+        all_dims = {
             "deep": self.deep_dim,
             "physics": physics_dim,
             "prnu": prnu_dim,
             "semantic": semantic_dim,
+            "freq": freq_dim,
         }
-        self.fusion = FeatureFusion(mode=fusion_mode, modality_dims=modality_dims)
+        modality_dims = {name: all_dims[name] for name in self.branch_names}
 
-        fused_dim = FeatureFusion.output_dim(
-            self.deep_dim,
-            physics_dim,
-            prnu_dim,
-            semantic_dim,
+        self.fusion = FeatureFusion(
             mode=fusion_mode,
-            num_modalities=4,
+            modality_dims=modality_dims,
+            branch_dropout=branch_dropout,
         )
+
+        fused_dim = sum(modality_dims.values())
         self.classifier = ClassificationHead(
             input_dim=fused_dim,
             hidden_dims=hidden_dims,
@@ -180,13 +197,13 @@ class FullHybridClassifier(nn.Module):
         )
 
     def _prepare_physics(self, physics_features: torch.Tensor) -> torch.Tensor:
-        if self.normalize_physics and self.physics_normalizer is not None:
+        if self.normalize_physics and self.physics_normalizer is not None and self.physics_normalizer.mean.shape[0] == physics_features.shape[-1]:
             normed = self.physics_normalizer.normalize_batch(physics_features.cpu().numpy())
             return torch.from_numpy(normed).to(physics_features.device)
         return physics_features
 
     def _prepare_prnu(self, prnu_features: torch.Tensor) -> torch.Tensor:
-        if self.normalize_prnu and self.prnu_normalizer is not None:
+        if self.normalize_prnu and self.prnu_normalizer is not None and self.prnu_normalizer.mean.shape[0] == prnu_features.shape[-1]:
             normed = self.prnu_normalizer.normalize_batch(prnu_features.cpu().numpy())
             return torch.from_numpy(normed).to(prnu_features.device)
         return prnu_features
@@ -204,42 +221,69 @@ class FullHybridClassifier(nn.Module):
     def forward(
         self,
         images: torch.Tensor,
-        physics_features: torch.Tensor,
-        prnu_features: torch.Tensor,
-        semantic_features: torch.Tensor,
+        physics_features: Optional[torch.Tensor] = None,
+        prnu_features: Optional[torch.Tensor] = None,
+        semantic_features: Optional[torch.Tensor] = None,
+        freq_features: Optional[torch.Tensor] = None,
+        **kwargs: Any,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        phys_in = physics_features if physics_features is not None else kwargs.get("physics")
+        prnu_in = prnu_features if prnu_features is not None else kwargs.get("prnu")
+        sem_in = semantic_features if semantic_features is not None else kwargs.get("semantic")
+        freq_in = freq_features if freq_features is not None else kwargs.get("freq")
+
         deep_features = self.feature_extractor(images)
-        physics = self._prepare_physics(physics_features)
-        prnu = self._prepare_prnu(prnu_features)
-        fused = self.fusion.fuse(
-            deep_features, physics, prnu, semantic_features
-        )
+        mods = {"deep": deep_features}
+        if "physics" in self.branch_names and phys_in is not None:
+            mods["physics"] = self._prepare_physics(phys_in)
+        if "prnu" in self.branch_names and prnu_in is not None:
+            mods["prnu"] = self._prepare_prnu(prnu_in)
+        if "semantic" in self.branch_names and sem_in is not None:
+            mods["semantic"] = sem_in
+        if "freq" in self.branch_names and freq_in is not None:
+            mods["freq"] = freq_in
+
+        fused = self.fusion.fuse(**mods)
         logits = self.classifier(fused)
         return logits, deep_features
 
     def predict_proba(
         self,
         images: torch.Tensor,
-        physics_features: torch.Tensor,
-        prnu_features: torch.Tensor,
-        semantic_features: torch.Tensor,
+        physics_features: Optional[torch.Tensor] = None,
+        prnu_features: Optional[torch.Tensor] = None,
+        semantic_features: Optional[torch.Tensor] = None,
+        freq_features: Optional[torch.Tensor] = None,
+        **kwargs: Any,
     ) -> torch.Tensor:
-        logits, _ = self.forward(images, physics_features, prnu_features, semantic_features)
+        logits, _ = self.forward(
+            images, physics_features, prnu_features, semantic_features, freq_features, **kwargs
+        )
         return torch.softmax(logits, dim=1)
 
     def get_fusion_weights(
         self,
         images: torch.Tensor,
-        physics_features: torch.Tensor,
-        prnu_features: torch.Tensor,
-        semantic_features: torch.Tensor,
+        physics_features: Optional[torch.Tensor] = None,
+        prnu_features: Optional[torch.Tensor] = None,
+        semantic_features: Optional[torch.Tensor] = None,
+        freq_features: Optional[torch.Tensor] = None,
+        **kwargs: Any,
     ) -> Dict[str, float]:
         deep_features = self.feature_extractor(images)
-        physics = self._prepare_physics(physics_features)
-        prnu = self._prepare_prnu(prnu_features)
-        return self.fusion.get_fusion_weights(
-            deep_features, physics, prnu, semantic_features
-        )
+        mods = {"deep": deep_features}
+        if "physics" in self.branch_names and physics_features is not None:
+            mods["physics"] = self._prepare_physics(physics_features)
+        if "prnu" in self.branch_names and prnu_features is not None:
+            mods["prnu"] = self._prepare_prnu(prnu_features)
+        if "semantic" in self.branch_names and semantic_features is not None:
+            mods["semantic"] = semantic_features
+        if "freq" in self.branch_names:
+            freq_in = freq_features if freq_features is not None else kwargs.get("freq")
+            if freq_in is not None:
+                mods["freq"] = freq_in
+        return self.fusion.get_fusion_weights(**mods)
+
 
     @staticmethod
     def decode_label(class_idx: int) -> str:

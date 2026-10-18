@@ -78,10 +78,14 @@ def load_model(checkpoint_path: str, device: torch.device):
             freeze_blocks=args.get("freeze_blocks", 5),
             pretrained=False,
             fusion_mode=fusion_mode,
+            branches=args.get("branches"),
             semantic_dim=args.get("semantic_dim", 384),
+            freq_dim=args.get("freq_dim", 64),
             normalize_physics=args.get("normalize_physics", True),
             normalize_prnu=args.get("normalize_prnu", True),
+            no_down=args.get("deep_no_down", False),
         )
+
     else:
         model = HybridClassifier(
             model_name=args.get("backbone", "efficientnet_b0"),

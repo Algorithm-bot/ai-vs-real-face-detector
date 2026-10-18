@@ -37,7 +37,9 @@ KEY = {
     "prnu_only": "prnu",
     "semantic_only": "semantic",
     "clip_linear": "semantic",
+    "freq_only": "freq",
 }
+
 
 
 
@@ -105,17 +107,24 @@ def main():
         rows = np.array(sorted(s[0] for s in chosen))
     print(f"[{mode}] train rows: {len(rows)}  val: {len(va['labels'])}  test: {len(te['labels'])}")
 
-    physics_norm = prnu_norm = norm = None
-    if mode in {"physics_only", "prnu_only"}:
-        physics_norm, prnu_norm = fit_physics_and_prnu_scalers([str(tr["paths"][i]) for i in rows])
-        norm = physics_norm if mode == "physics_only" else prnu_norm
+    physics_norm = prnu_norm = freq_norm = norm = None
+    if mode in {"physics_only", "prnu_only", "freq_only"}:
+        if mode == "freq_only":
+            from src.physics_branch.normalization import PhysicsNormalizer
+            norm = freq_norm = PhysicsNormalizer.fit(tr["freq"][rows])
+        else:
+            physics_norm, prnu_norm = fit_physics_and_prnu_scalers([str(tr["paths"][i]) for i in rows])
+            norm = physics_norm if mode == "physics_only" else prnu_norm
 
+    from src.freq_branch.extractor import FREQ_FEATURE_DIM
     dims = {
         "physics_only": PHYSICS_FEATURE_DIM,
         "prnu_only": PRNU_FEATURE_DIM,
         "semantic_only": args.semantic_dim,
         "clip_linear": args.semantic_dim,
+        "freq_only": FREQ_FEATURE_DIM,
     }
+
 
     def prep(d, idx=None):
         X = d[key] if idx is None else d[key][idx]
