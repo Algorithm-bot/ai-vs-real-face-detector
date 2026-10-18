@@ -59,8 +59,12 @@ def _prnu_view(rgb, m=256):
 
 
 class FeatureDataset(Dataset):
-    def __init__(self, samples):
+    def __init__(self, samples, preprocess_mode: str = "crop", crop_size: int = 224, enable_augment: bool = False, seed: int = 42):
         self.samples = samples
+        self.preprocess_mode = preprocess_mode
+        self.crop_size = crop_size
+        self.enable_augment = enable_augment
+        self.seed = seed
         self.physics = None
         self.prnu = None
 
@@ -68,6 +72,9 @@ class FeatureDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, i):
+        from src.augment import augment_raw_image
+        from src.preprocess import PreprocessPipeline
+
         if self.physics is None:  # built lazily so each worker owns its extractors
             self.physics = PhysicsFeatureExtractor()
             self.prnu = PRNUExtractor()
@@ -77,17 +84,35 @@ class FeatureDataset(Dataset):
             if bgr is None:
                 raise IOError("unreadable image")
             rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-            p = np.asarray(self.physics.extract(rgb).vector, dtype=np.float32)
-            q = np.asarray(self.prnu.extract(_prnu_view(rgb)).vector, dtype=np.float32)
-            v = cv2.resize(rgb, (224, 224), interpolation=cv2.INTER_AREA)  # same as SemanticEncoder
+            
+            # Apply training augmentation at raw resolution if enabled (with deterministic path seeding)
+            if self.enable_augment:
+                rgb, crop_rng = augment_raw_image(
+                    rgb, path=path, epoch=0, base_seed=self.seed, enable_augment=True
+                )
+            else:
+                crop_rng = None
+
+            # Shared preprocessing: crop or resize
+            pipeline = PreprocessPipeline(
+                mode=self.preprocess_mode,
+                crop_size=self.crop_size,
+                is_training=self.enable_augment,
+            )
+            processed_rgb = pipeline.preprocess_image(rgb, rng=crop_rng)
+
+            p = np.asarray(self.physics.extract(processed_rgb).vector, dtype=np.float32)
+            q = np.asarray(self.prnu.extract(processed_rgb).vector, dtype=np.float32)
+            v = processed_rgb  # 224x224x3 uint8 passed to ViT/CLIP
             ok = 1
         except Exception as exc:  # keep a long job alive; bad images are dropped later
             print(f"\n[skip] {path}: {exc}", flush=True)
             p = np.zeros(PHYSICS_FEATURE_DIM, dtype=np.float32)
             q = np.zeros(PRNU_FEATURE_DIM, dtype=np.float32)
-            v = np.zeros((224, 224, 3), dtype=np.uint8)
+            v = np.zeros((self.crop_size, self.crop_size, 3), dtype=np.uint8)
             ok = 0
         return torch.from_numpy(p), torch.from_numpy(q), torch.from_numpy(v), ok
+
 
 
 def process_split(split, samples, encoder, device, cache_dir, args):
@@ -106,11 +131,19 @@ def process_split(split, samples, encoder, device, cache_dir, args):
         if shard.exists():
             continue
         chunk = samples[k * args.shard_size:(k + 1) * args.shard_size]
+        enable_aug = getattr(args, "augment", False) and split == "train"
         loader = DataLoader(
-            FeatureDataset(chunk), batch_size=64, shuffle=False,
+            FeatureDataset(
+                chunk,
+                preprocess_mode=getattr(args, "preprocess", "crop"),
+                enable_augment=enable_aug,
+                seed=args.seed,
+            ),
+            batch_size=64, shuffle=False,
             num_workers=args.workers, pin_memory=True,
             prefetch_factor=4 if args.workers > 0 else None,
         )
+
         phys, prnu, sem, oks = [], [], [], []
         for p, q, v, ok in tqdm(loader, desc=f"{split} shard {k + 1}/{n_shards}"):
             x = v.to(device, non_blocking=True).permute(0, 3, 1, 2).float() / 255.0
@@ -156,6 +189,10 @@ def main():
     ap.add_argument("--shard-size", type=int, default=20000)
     ap.add_argument("--semantic-model", default=DEFAULT_VIT_MODEL)
     ap.add_argument("--no-semantic-pretrained", action="store_true")
+    ap.add_argument("--preprocess", choices=["crop", "resize"], default="crop",
+                    help="crop = random crop on train, center crop on test; resize = legacy")
+    ap.add_argument("--augment", action="store_true",
+                    help="Apply training augmentation (Blur+JPEG) at raw resolution before crop")
     ap.add_argument("--splits", nargs="+", default=["train", "val", "test"])
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--force", action="store_true")
@@ -181,9 +218,13 @@ def main():
         "prnu_dim": PRNU_FEATURE_DIM,
         "semantic_dim": int(encoder.embedding_dim),
         "max_train_per_class": args.max_train_per_class,
+        "preprocess": args.preprocess,
+        "crop_size": 224,
+        "augment": bool(args.augment),
         "seed": args.seed,
     }
     (cache_dir / "meta.json").write_text(json.dumps(meta, indent=2))
+
 
     for split in args.splits:
         file_list_path = cache_dir / f"{split}_file_list.json"

@@ -175,21 +175,23 @@ def predict(
     prnu_result = None
     semantic_result = None
 
+    processed_rgb, _ = preprocessor.preprocess_numpy(rgb)
+
     with torch.no_grad():
         if mode in {"physics_only", "prnu_only", "semantic_only"}:
             with PhysicsFeatureExtractor() as physics_ext:
-                physics_result = physics_ext.extract(rgb)
+                physics_result = physics_ext.extract(processed_rgb)
                 physics_features = _enrich_physics_dict(physics_result.to_dict(), physics_result)
                 physics_t = torch.from_numpy(physics_result.vector).unsqueeze(0).to(device_t)
             if mode == "physics_only":
                 feats = physics_t
             elif mode == "prnu_only":
-                prnu_result = PRNUExtractor().extract(rgb)
+                prnu_result = PRNUExtractor().extract(processed_rgb)
                 prnu_t = torch.from_numpy(prnu_result.vector).unsqueeze(0).to(device_t)
                 feats = prnu_t
             else:
                 semantic_enc = _get_semantic_encoder("vit_small_patch16_224", device_t)
-                semantic_result = semantic_enc.extract(rgb, return_attention=True)
+                semantic_result = semantic_enc.extract(processed_rgb, return_attention=True)
                 semantic_t = torch.from_numpy(semantic_result.features).unsqueeze(0).to(device_t)
                 feats = semantic_t
             logits, _ = model(feats)
@@ -197,7 +199,7 @@ def predict(
             fusion_weights = {mode.replace("_only", ""): 1.0}
         elif mode in ("hybrid", "full_hybrid"):
             with PhysicsFeatureExtractor() as physics_ext:
-                physics_result = physics_ext.extract(rgb)
+                physics_result = physics_ext.extract(processed_rgb)
                 physics = physics_result.vector
                 physics_features = _enrich_physics_dict(physics_result.to_dict(), physics_result)
             physics_t = torch.from_numpy(physics).unsqueeze(0).to(device_t)
@@ -209,7 +211,7 @@ def predict(
                 semantic_enc = _get_semantic_encoder(
                     semantic_model, device_t, model.semantic_pretrained
                 )
-                semantic_result = semantic_enc.extract(rgb, return_attention=True)
+                semantic_result = semantic_enc.extract(processed_rgb, return_attention=True)
                 prnu_t = torch.from_numpy(prnu_result.vector).unsqueeze(0).to(device_t)
                 semantic_t = torch.from_numpy(semantic_result.features).unsqueeze(0).to(device_t)
                 probs = model.predict_proba(tensor, physics_t, prnu_t, semantic_t)[0].cpu().numpy()
@@ -217,25 +219,25 @@ def predict(
             else:
                 probs = model.predict_proba(tensor, physics_t)[0].cpu().numpy()
                 fusion_weights = {"deep": 0.5, "physics": 0.5}
-                prnu_result = PRNUExtractor().extract(rgb) if include_full_explainability else None
+                prnu_result = PRNUExtractor().extract(processed_rgb) if include_full_explainability else None
                 semantic_result = None
         else:
             logits, _ = model(tensor)
             probs = torch.softmax(logits, dim=1)[0].cpu().numpy()
             fusion_weights = {"deep": 1.0}
-            prnu_result = PRNUExtractor().extract(rgb) if include_full_explainability else None
+            prnu_result = PRNUExtractor().extract(processed_rgb) if include_full_explainability else None
             semantic_result = None
 
     # Extract semantic/ViT for explainability even if not in classifier
     if include_full_explainability and semantic_result is None:
         try:
             semantic_enc = _get_semantic_encoder("vit_small_patch16_224", device_t)
-            semantic_result = semantic_enc.extract(rgb, return_attention=True)
+            semantic_result = semantic_enc.extract(processed_rgb, return_attention=True)
         except Exception:
             semantic_result = None
 
     if include_full_explainability and prnu_result is None:
-        prnu_result = PRNUExtractor().extract(rgb)
+        prnu_result = PRNUExtractor().extract(processed_rgb)
 
     calibrator = ProbabilityCalibrator(temperature=cfg.inference.temperature)
     uncertainty_est = UncertaintyEstimator(

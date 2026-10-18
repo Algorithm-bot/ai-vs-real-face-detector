@@ -43,6 +43,12 @@ class PreprocessConfig:
     clahe_clip_limit: float = 2.0
     clahe_tile_grid_size: Tuple[int, int] = (8, 8)
 
+    # Item 2: Preprocessing mode ("crop" or "resize")
+    mode: str = "crop"
+    is_training: bool = False
+    seed: Optional[int] = None
+
+
 
 class FacePreprocessor:
     """
@@ -222,13 +228,19 @@ class FacePreprocessor:
                 image
             )
 
-        # Resize is cheap compared with
-        # bilateral filtering and CLAHE.
-        image = self.resize(
-            image
+        from src.preprocess import PreprocessPipeline
+
+        # Apply crop or resize according to config
+        pipeline = PreprocessPipeline(
+            mode=self.config.mode,
+            crop_size=self.config.image_size,
+            is_training=self.config.is_training,
+            seed=self.config.seed,
         )
+        image = pipeline.preprocess_image(image)
 
         return image, align_result
+
 
     def preprocess_numpy_with_meta(
         self,

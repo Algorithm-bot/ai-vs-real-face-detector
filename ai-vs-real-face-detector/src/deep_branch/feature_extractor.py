@@ -21,17 +21,23 @@ class DeepFeatureExtractor(nn.Module):
         pretrained: bool = True,
         freeze_blocks: int = 5,
         embedding_dim: Optional[int] = None,
+        no_down: bool = False,
     ) -> None:
         super().__init__()
         self.model_name = model_name
+        self.no_down = no_down
         self.backbone = timm.create_model(
             model_name,
             pretrained=pretrained,
             num_classes=0,
             global_pool="avg",
         )
+        if no_down:
+            if hasattr(self.backbone, "conv_stem") and hasattr(self.backbone.conv_stem, "stride"):
+                self.backbone.conv_stem.stride = (1, 1)
         self.embedding_dim = embedding_dim or self.backbone.num_features
         self._freeze_early_layers(freeze_blocks)
+
 
     def _freeze_early_layers(self, freeze_blocks: int) -> None:
         if freeze_blocks <= 0:
@@ -62,13 +68,16 @@ class DeepClassifier(nn.Module):
         freeze_blocks: int = 5,
         dropout: float = 0.3,
         num_classes: int = 2,
+        no_down: bool = False,
     ) -> None:
         super().__init__()
         self.feature_extractor = DeepFeatureExtractor(
             model_name=model_name,
             pretrained=pretrained,
             freeze_blocks=freeze_blocks,
+            no_down=no_down,
         )
+
         dim = self.feature_extractor.embedding_dim
         self.classifier = nn.Sequential(
             nn.Dropout(dropout),

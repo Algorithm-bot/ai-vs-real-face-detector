@@ -379,56 +379,80 @@ def process_face_sample(
     rgb: np.ndarray,
     label: int,
     source: str,
-    preprocessor: FacePreprocessor,
-    transform,
-    physics_extractor,
-    prnu_extractor,
-    semantic_extractor,
-    use_physics: bool,
-    use_prnu: bool,
-    use_semantic: bool,
+    preprocessor: Optional[FacePreprocessor] = None,
+    transform: Optional[Any] = None,
+    physics_extractor: Optional[Any] = None,
+    prnu_extractor: Optional[Any] = None,
+    semantic_extractor: Optional[Any] = None,
+    use_physics: bool = False,
+    use_prnu: bool = False,
+    use_semantic: bool = False,
     cached: Optional[Dict[str, np.ndarray]] = None,
     use_freq: bool = False,
+    path: str = "",
+    epoch: int = 0,
+    seed: int = 42,
+    enable_augment: bool = False,
+    preprocess_mode: str = "crop",
+    crop_size: int = 224,
 ) -> dict:
-    """Build model inputs from one decoded RGB image.
+    from src.augment import augment_raw_image
+    from src.preprocess import PreprocessPipeline
 
-    ``cached`` contains path-independent precomputed feature vectors when a
-    local feature cache is attached.  This deliberately has no path argument
-    so the same processing is usable by streamed WebDataset samples.
-    """
+    # Item 2b: Training augmentation (Blur+JPEG) applied at raw resolution BEFORE crop
+    # Deterministic per-path seeding ensures cached and live branches see identical pixels
+    if enable_augment:
+        rgb, crop_rng = augment_raw_image(
+            rgb, path=path, epoch=epoch, base_seed=seed, enable_augment=True
+        )
+    else:
+        crop_rng = None
+
+
+    # Preprocessing: crop or resize to 224x224
+    if preprocessor is not None:
+        pil = preprocessor.preprocess_pil(Image.fromarray(rgb))
+        processed_rgb = np.array(pil)
+    else:
+        pipeline = PreprocessPipeline(
+            mode=preprocess_mode, crop_size=crop_size, is_training=enable_augment
+        )
+        processed_rgb = pipeline.preprocess_image(rgb, rng=crop_rng)
+        pil = Image.fromarray(processed_rgb)
+
+    # Branches extract from the consistent processed_rgb
     if use_physics:
-        if cached is not None:
+        if cached is not None and "physics" in cached:
             physics_vec = cached["physics"]
         else:
             if physics_extractor is None:
                 raise RuntimeError("Physics extractor is unavailable.")
-            physics_vec = physics_extractor.extract(rgb).vector
+            physics_vec = physics_extractor.extract(processed_rgb).vector
     else:
         physics_vec = np.zeros(PHYSICS_FEATURE_DIM, dtype=np.float32)
 
     if use_prnu:
-        if cached is not None:
+        if cached is not None and "prnu" in cached:
             prnu_vec = cached["prnu"]
         else:
             if prnu_extractor is None:
-                raise RuntimeError("PRNU extractor is unavailable for full_hybrid.")
-            prnu_vec = prnu_extractor.extract(rgb).vector
+                raise RuntimeError("PRNU extractor is unavailable.")
+            prnu_vec = prnu_extractor.extract(processed_rgb).vector
     else:
         prnu_vec = None
 
     if use_semantic:
-        if cached is not None:
+        if cached is not None and "semantic" in cached:
             semantic_vec = cached["semantic"]
         else:
             if semantic_extractor is None:
-                raise RuntimeError("Semantic extractor is unavailable for full_hybrid.")
+                raise RuntimeError("Semantic extractor is unavailable.")
             semantic_vec = semantic_extractor.extract(
-                rgb, return_attention=False
+                processed_rgb, return_attention=False
             ).features
     else:
         semantic_vec = None
 
-    pil = preprocessor.preprocess_pil(Image.fromarray(rgb))
     sample = {
         "image": transform(pil),
         "label": torch.tensor(label, dtype=torch.long),
@@ -822,16 +846,23 @@ class FaceBinaryDataset(Dataset):
                 pretrained=self.semantic_pretrained,
                 device=torch.device("cpu"),
             )
+        epoch = getattr(self, "epoch", 0)
+        enable_augment = getattr(self, "enable_augment", False)
+        preprocess_mode = getattr(self, "preprocess_mode", "crop")
         sample = process_face_sample(
             rgb, label, source, self.preprocessor, self.transform,
             self.physics_extractor, self.prnu_extractor, self.semantic_extractor,
             self.use_physics, self.use_prnu, self.use_semantic, cached=cached,
             use_freq=self.use_freq,
+            path=path,
+            epoch=epoch,
+            seed=getattr(self, "seed", 42),
+            enable_augment=enable_augment,
+            preprocess_mode=preprocess_mode,
         )
-        # The shared processor intentionally has no path knowledge; preserve
-        # the local dataset's established output contract here.
         sample["path"] = path
         return sample
+
 
 
 class StreamingFaceBinaryDataset(IterableDataset):
@@ -3160,6 +3191,18 @@ def parse_args():
         help="Stop when validation accuracy fails to improve for this many consecutive epochs.",
     )
 
+    parser.add_argument(
+        "--preprocess",
+        choices=["crop", "resize"],
+        default="crop",
+        help="crop = random 224x224 crop train, center crop eval; resize = legacy",
+    )
+    parser.add_argument(
+        "--deep-no-down",
+        action="store_true",
+        default=False,
+        help="Set EfficientNet-B0 stem conv stride from 2 to 1",
+    )
     parser.add_argument(
         "--batch-size",
         type=int,
