@@ -1259,6 +1259,20 @@ def build_loaders(args, device: torch.device, folder_filter: Optional[List[str]]
     elif streaming and effective_cap > 0:
         print("WARNING: --max-train-images / --max-train-per-class is ignored for hf-stream datasets.")
 
+    if getattr(args, "deep_no_down", False):
+        n_train = len(train_ds.samples) if hasattr(train_ds, "samples") else getattr(args, "known_train_size", 721869)
+        # Measured forward-only speed is ~35 img/s on T4; training (forward + backward + optimizer) is ~15-20 img/s
+        est_train_throughput = 18.0  # img/s
+        est_epoch_seconds = n_train / est_train_throughput
+        est_epoch_hours = est_epoch_seconds / 3600.0
+        print("\n" + "!" * 72)
+        print("WARNING: --deep-no-down is ENABLED (EfficientNet stem stride 1 instead of 2).")
+        print("  - VRAM usage will increase significantly (~4.7 GB vs ~1.2 GB).")
+        print(f"  - Training set size: {n_train:,} images.")
+        print(f"  - Forward-only throughput: ~35 img/s; full forward+backward training: ~{est_train_throughput:.0f} img/s on T4.")
+        print(f"  - Dynamic estimated training time per epoch: {est_epoch_hours:.2f} hours (~{est_epoch_seconds/60:.1f} minutes).")
+        print("!" * 72 + "\n")
+
     # --------------------------------------------------------
     # Validation dataset
     # --------------------------------------------------------
@@ -3435,12 +3449,15 @@ def main() -> None:
     print("=" * 60)
 
     if getattr(args, "deep_no_down", False):
-        print("\n" + "!" * 70)
+        cap = getattr(args, "max_train_images", 0)
+        n_est = cap if cap > 0 else 721869
+        est_hrs = (n_est / 18.0) / 3600.0
+        print("\n" + "!" * 72)
         print("WARNING: --deep-no-down is ENABLED (EfficientNet stem stride 1 instead of 2).")
         print("  - VRAM usage will increase significantly (~4.7 GB vs ~1.2 GB).")
-        print("  - Throughput drops ~10x (~35 img/s vs ~385 img/s on NVIDIA T4 GPU).")
-        print("  - Estimated epoch time for 72k train images: ~34 minutes/epoch (vs ~3 mins/epoch).")
-        print("!" * 70 + "\n")
+        print("  - Forward throughput drops ~10x (~35 img/s vs ~385 img/s on NVIDIA T4).")
+        print(f"  - Training throughput (fwd+bwd) is ~18 img/s. Estimated epoch time for {n_est:,} images: ~{est_hrs:.1f} hours.")
+        print("!" * 72 + "\n")
 
     # --------------------------------------------------------
     # Run selected mode

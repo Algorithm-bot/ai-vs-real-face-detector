@@ -187,7 +187,7 @@ To run on Kaggle with the new architecture:
 3. **Run Verification Cell**:
    Add a cell immediately after cloning to run `kaggle_verify.py` and verify environment and dataset integrity before starting training or caching:
    ```python
-   !python kaggle_verify.py --data-dir $KAGGLE_DATASET_MOUNT --feature-cache /kaggle/working/feature_cache
+   !python kaggle_verify.py --data-dir $KAGGLE_DATASET_MOUNT --feature-cache /kaggle/working/feature_cache_v2
    ```
 
 ### B. Unverified Items Deferred to Kaggle
@@ -203,25 +203,33 @@ The following items cannot be fully verified locally without GPU accelerators an
 
 ## 5. Compute Cost & Resource Estimates
 
-### A. Cache Rebuild Time Formula
-The total cache rebuild time depends on whether the GPU or CPU pipeline is the bottleneck:
+### A. Cache Rebuild Time Estimates across Splits (train + val + test)
+The dataset comprises three splits:
+- `train`: **721,869** images (ProGAN real & fake)
+- `val`: **8,375** images (ProGAN real & fake validation)
+- `test`: **90,704** images (42 ForenSynths test generator folders)
+- **Full Total (all 3 splits)**: **820,948** images
+- **With `--max-train-images 200000`**: $200{,}000 + 8{,}375 + 90{,}704 =$ **299,079** images
+
+#### Rebuild Time Formula (Estimates):
 $$\text{Time (hours)} = \frac{N_{\text{images}}}{3600 \times \min\left(\text{Throughput}_{\text{CLIP}}, \, N_{\text{workers}} \times \text{Throughput}_{\text{Freq+Physics}}\right)}$$
 
-- $N_{\text{images}} = 90{,}245$ (for the entire ForenSynths suite).
-- $\text{Throughput}_{\text{CLIP}}$: Measured in img/s on GPU (e.g. ~35–45 img/s on T4 in fp16 with batch size 64).
-- $\text{Throughput}_{\text{Freq+Physics}}$: Measured in img/s per CPU core (e.g. ~16 img/s per core).
-- With 2–3 CPU workers on Kaggle:
-  $$\text{Effective Throughput} \approx \min(40, 2 \times 16) \approx 32\text{ img/s}$$
-  $$\text{Total Time} \approx \frac{90{,}245}{3600 \times 32} \approx 0.78\text{ hours (~47 minutes)}$$
-- If throughput on Kaggle is constrained, use `--max-train-images N` (e.g. `--max-train-images 10000`) on `src/cache_features.py` to balance and cap the training subset.
+*(Note: All times below are theoretical estimates; actual throughput depends on Kaggle disk I/O and GPU batching).*
+
+| Dataset Scope | Image Count | At 32 img/s (CPU bottleneck, 2 workers) | At 45 img/s (Kaggle CLIP GPU peak) | At 60 img/s (3 CPU workers + GPU) |
+| :--- | :--- | :--- | :--- | :--- |
+| **Test split only** | 90,704 | **~0.79 hours** (~47 mins) | **~0.56 hours** (~34 mins) | **~0.42 hours** (~25 mins) |
+| **With `--max-train-images 200000`** (train+val+test) | 299,079 | **~2.60 hours** (~2h 36m) | **~1.85 hours** (~1h 51m) | **~1.38 hours** (~1h 23m) |
+| **Full Dataset** (train+val+test, full 721k train) | 820,948 | **~7.13 hours** (~7h 08m) | **~5.07 hours** (~5h 04m) | **~3.80 hours** (~3h 48m) |
+
+*Recommendation*: For Kaggle interactive sessions (typically 9-12h timeout per run), using `--max-train-images 200000` keeps the entire multi-branch cache rebuild comfortably under 2 hours.
 
 ### B. Component Resource Breakdown
 
 | Component | Hardware | Memory (VRAM) | Estimated Throughput / Time |
 | :--- | :--- | :--- | :--- |
 | **EfficientNet-B0 (default stride 2)** | NVIDIA T4 / RTX | ~1.2 GB | ~385 img/s (~4 mins for 90k images) |
-| **EfficientNet-B0 (`--deep-no-down` stride 1)** | NVIDIA T4 / RTX | ~4.7 GB | ~35 img/s (~42 mins for 90k images) |
+| **EfficientNet-B0 (`--deep-no-down` stride 1)** | NVIDIA T4 / RTX | ~4.7 GB | ~35 img/s fwd / ~18 img/s train |
 | **CLIP ViT-L/14 (fp16, batch size 64)** | NVIDIA T4 / RTX | ~2.3 GB | ~35-45 img/s (~35-45 mins for 90k images) |
 | **Frequency Branch Extraction (CPU)** | 1 CPU Core | < 100 MB | ~16 img/s (vectorized NumPy) |
-| **Full Hybrid Cache Generation** | 1x T4 + 2 CPU Workers | ~3.5 GB | ~1.0 - 1.5 hours total for ForenSynths |
 | **Stacking Logistic Regression (DEV)** | CPU | < 500 MB | < 15 seconds |
