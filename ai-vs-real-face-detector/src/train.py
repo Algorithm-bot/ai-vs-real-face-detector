@@ -97,6 +97,9 @@ from src.physics_branch.normalization import PhysicsNormalizer
 from src.prnu_branch.extractor import PRNUExtractor, PRNU_FEATURE_DIM
 from src.semantic_branch.encoder import DEFAULT_VIT_MODEL, SemanticEncoder
 from src.fusion.fuse import FusionMode
+from src.eval.cache_meta import check_cache_meta, requested_meta_from_args
+from src.eval.splits import DEFAULT_SPLITS_PATH, filter_samples, load_split_spec
+from src.eval.train_select import parse_seed_list, save_epoch_snapshot
 
 
 # ============================================================
@@ -385,6 +388,7 @@ def process_face_sample(
     use_prnu: bool,
     use_semantic: bool,
     cached: Optional[Dict[str, np.ndarray]] = None,
+    use_freq: bool = False,
 ) -> dict:
     """Build model inputs from one decoded RGB image.
 
@@ -435,6 +439,13 @@ def process_face_sample(
         sample["prnu"] = torch.from_numpy(np.asarray(prnu_vec, dtype=np.float32))
     if semantic_vec is not None:
         sample["semantic"] = torch.from_numpy(np.asarray(semantic_vec, dtype=np.float32))
+    if use_freq:
+        if cached is not None and cached.get("freq") is not None:
+            freq_vec = cached["freq"]
+        else:
+            from src.freq_branch.extractor import FreqExtractor
+            freq_vec = np.asarray(FreqExtractor().extract(rgb).vector, dtype=np.float32)
+        sample["freq"] = torch.from_numpy(np.asarray(freq_vec, dtype=np.float32))
     return sample
 
 
@@ -473,11 +484,14 @@ class FaceBinaryDataset(Dataset):
         use_physics: bool = False,
         use_prnu: bool = False,
         use_semantic: bool = False,
+        use_freq: bool = False,
         semantic_model: str = DEFAULT_VIT_MODEL,
         semantic_pretrained: bool = True,
         preprocessor: Optional[FacePreprocessor] = None,
         transform=None,
         feature_cache_dir: Optional[str] = None,
+        folder_filter: Optional[List[str]] = None,
+        legacy_cache: bool = False,
     ) -> None:
 
         if split not in {"train", "val", "test"}:
@@ -489,6 +503,7 @@ class FaceBinaryDataset(Dataset):
         self.use_physics = use_physics
         self.use_prnu = use_prnu
         self.use_semantic = use_semantic
+        self.use_freq = use_freq
         self.semantic_model = semantic_model
         self.semantic_pretrained = semantic_pretrained
 
@@ -499,6 +514,8 @@ class FaceBinaryDataset(Dataset):
         )
 
         self.transform = transform
+        self.folder_filter = folder_filter
+        self.legacy_cache = legacy_cache
         self._cache_row = None
         self._cache_arrays = None
         # Six direct directory checks only. Nested CNNDetection discovery is
@@ -678,6 +695,14 @@ class FaceBinaryDataset(Dataset):
             else:
                 self.samples = val_samples
 
+        if self.folder_filter:
+            self.samples = filter_samples(self.samples, self.folder_filter)
+            if not self.samples:
+                raise FileNotFoundError(
+                    f"No images remained after applying folder_filter={self.folder_filter!r} "
+                    f"on split {split!r}."
+                )
+
         # ----------------------------------------------------
         # Print split composition
         # ----------------------------------------------------
@@ -716,22 +741,19 @@ class FaceBinaryDataset(Dataset):
         )
 
         cache_dir = feature_cache_dir or os.environ.get("FEATURE_CACHE_DIR")
-        if cache_dir and (use_physics or use_prnu or use_semantic):
+        if cache_dir and (use_physics or use_prnu or use_semantic or use_freq):
             self.attach_feature_cache(cache_dir, split)
 
     def attach_feature_cache(self, cache_dir: str, split: str) -> None:
         """Serve physics/PRNU/semantic vectors from cache_features.py output."""
         cache_dir = Path(cache_dir)
-        meta_path = cache_dir / "meta.json"
-        if meta_path.exists():
-            meta = json.loads(meta_path.read_text())
-            if self.use_semantic and meta.get("semantic_model") != self.semantic_model:
-                raise RuntimeError(
-                    f"Feature cache was built with semantic model "
-                    f"{meta.get('semantic_model')!r}, not {self.semantic_model!r}."
-                )
+        requested = {"semantic_model": self.semantic_model} if self.use_semantic else {}
+        extra = getattr(self, "cache_requested_meta", None)
+        if extra:
+            requested.update(extra)
+        check_cache_meta(cache_dir, requested, legacy=self.legacy_cache)
         z = np.load(cache_dir / f"{split}.npz")
-        arrays = {k: z[k] for k in ("physics", "prnu", "semantic")}
+        arrays = {k: z[k] for k in z.files if k in {"physics", "prnu", "semantic", "freq"}}
         row = {str(p): i for i, p in enumerate(z["paths"])}
         kept = [s for s in self.samples if s[0] in row]
         if len(kept) != len(self.samples):
@@ -789,9 +811,8 @@ class FaceBinaryDataset(Dataset):
         if self._cache_row is not None:
             row = self._cache_row[path]
             cached = {
-                "physics": self._cache_arrays["physics"][row],
-                "prnu": self._cache_arrays["prnu"][row],
-                "semantic": self._cache_arrays["semantic"][row],
+                key: self._cache_arrays[key][row]
+                for key in self._cache_arrays
             }
         if self.use_semantic and cached is None and self.semantic_extractor is None:
             # Lazy construction avoids loading a ViT in stage1/hybrid modes
@@ -805,6 +826,7 @@ class FaceBinaryDataset(Dataset):
             rgb, label, source, self.preprocessor, self.transform,
             self.physics_extractor, self.prnu_extractor, self.semantic_extractor,
             self.use_physics, self.use_prnu, self.use_semantic, cached=cached,
+            use_freq=self.use_freq,
         )
         # The shared processor intentionally has no path knowledge; preserve
         # the local dataset's established output contract here.
@@ -1022,6 +1044,7 @@ class StreamingFaceBinaryDataset(IterableDataset):
                 rgb, label, source, self.preprocessor, self.transform,
                 self.physics_extractor, self.prnu_extractor, self.semantic_extractor,
                 self.use_physics, self.use_prnu, self.use_semantic,
+                use_freq=getattr(self, "use_freq", False),
             )
 
 
@@ -1117,13 +1140,13 @@ def fit_streaming_feature_scalers(
     )
 
 
-def build_loaders(args, device: torch.device):
+def build_loaders(args, device: torch.device, folder_filter: Optional[List[str]] = None, split: Optional[str] = None):
 
     preprocessor = FacePreprocessor()
     streaming = args.data_source == "hf-stream"
     dataset_discovery_seconds = 0.0
 
-    def make_dataset(split: str, transform):
+    def make_dataset(split_name: str, transform, folders=None):
         common = dict(
             use_physics=args.mode in PHYSICS_MODES,
             use_prnu=args.mode in PRNU_MODES,
@@ -1136,27 +1159,41 @@ def build_loaders(args, device: torch.device):
         if streaming:
             return StreamingFaceBinaryDataset(
                 repo_id=args.hf_dataset_repo,
-                split=split,
+                split=split_name,
                 seed=args.seed,
                 **common,
             )
         return FaceBinaryDataset(
             root=args.data_dir,
-            split=split,
+            split=split_name,
             val_ratio=args.val_ratio,
             seed=args.seed,
             feature_cache_dir=args.feature_cache,
+            folder_filter=folders,
+            legacy_cache=bool(getattr(args, "legacy", False)),
             **common,
         )
 
-    def make_timed_dataset(split: str, transform):
+    def make_timed_dataset(split_name: str, transform, folders=None):
         nonlocal dataset_discovery_seconds
         started_at = time.perf_counter()
-        dataset = make_dataset(split, transform)
+        dataset = make_dataset(split_name, transform, folders=folders)
         elapsed = time.perf_counter() - started_at
         dataset_discovery_seconds += elapsed
-        print(f"[dataset] {split} discovery: {elapsed:.1f} sec")
+        print(f"[dataset] {split_name} discovery: {elapsed:.1f} sec")
         return dataset
+
+    if split is not None:
+        ds = make_timed_dataset(split, get_val_transforms(), folders=folder_filter)
+        loader = DataLoader(
+            ds,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=(device.type == "cuda"),
+            **_loader_extras(args),
+        )
+        return loader
 
     # --------------------------------------------------------
     # Training dataset
@@ -1810,6 +1847,85 @@ def save_checkpoint(
     )
 
 
+def _epoch_checkpoint_index(path: Path) -> int:
+    try:
+        return int(path.stem.rsplit("_", 1)[-1])
+    except ValueError:
+        return -1
+
+
+def rotate_epoch_checkpoints(output_dir: Path, mode: str, keep: int) -> None:
+    if keep <= 0:
+        return
+    existing = sorted(
+        Path(output_dir).glob(f"{mode}_epoch_*.pt"),
+        key=_epoch_checkpoint_index,
+    )
+    for old in existing[:-keep]:
+        try:
+            old.unlink()
+        except OSError:
+            pass
+
+
+def _splits_path(args):
+    raw = getattr(args, "splits_yaml", None) or ""
+    return raw if raw else None
+
+
+def resolve_selection_loader(args, device, val_loader):
+    """DEV loader from the test tree, or ProGAN-val when --legacy / unavailable."""
+    if getattr(args, "legacy", False):
+        return val_loader, "val"
+    try:
+        spec = load_split_spec(_splits_path(args) or DEFAULT_SPLITS_PATH)
+        loader = build_loaders(args, device, folder_filter=spec.dev, split="test")
+        print(f"Checkpoint selection uses DEV folders from {spec.path}")
+        return loader, "dev"
+    except Exception as exc:
+        print(f"WARNING: DEV split unavailable ({exc}); selecting on validation.")
+        return val_loader, "val"
+
+
+def report_eval_loader(args, device, test_loader):
+    """Headline metrics must not include DEV folders unless --legacy."""
+    if getattr(args, "legacy", False) or test_loader is None:
+        return test_loader, "test"
+    try:
+        spec = load_split_spec(_splits_path(args) or DEFAULT_SPLITS_PATH)
+        loader = build_loaders(args, device, folder_filter=spec.report, split="test")
+        print(f"Final metrics use REPORT folders from {spec.path}")
+        return loader, "report"
+    except Exception as exc:
+        print(f"WARNING: REPORT split unavailable ({exc}); using full test loader.")
+        return test_loader, "test"
+
+
+def score_checkpoint(args, model, device, mode, val_metrics, selection_loader, selection_name):
+    if getattr(args, "legacy", False) or selection_name == "val":
+        return float(val_metrics.get("acc", 0.0)), val_metrics
+    score, details, _collected = eval_selection_score(model, selection_loader, device, mode)
+    merged = dict(val_metrics)
+    merged.update(details)
+    merged["selection_score"] = float(score)
+    print(
+        f"[DEV] auc={details.get('auc')}  bacc={details.get('balanced_accuracy'):.4f}  "
+        f"score={score:.4f}"
+    )
+    return float(score), merged
+
+
+def eval_selection_score(model, loader, device, mode: str):
+    from src.eval.forward import predict_loader
+    from src.eval.metrics import selection_score as _selection_score
+
+    collected = predict_loader(model, mode, loader, device)
+    score, details = _selection_score(collected["label"], collected["p_ai"])
+    details["acc"] = details.get("balanced_accuracy", 0.0)
+    details["roc_auc"] = details.get("auc")
+    return score, details, collected
+
+
 # ============================================================
 # STAGE 1 TRAINING
 # ============================================================
@@ -1825,6 +1941,17 @@ def run_stage1(
     print("=" * 60)
 
     train_loader, val_loader, test_loader = build_loaders(args, device)
+    selection_loader, selection_name = val_loader, "val"
+    if not getattr(args, "legacy", False):
+        try:
+            spec = load_split_spec(getattr(args, "splits_yaml", None) or DEFAULT_SPLITS_PATH)
+            selection_loader = build_loaders(
+                args, device, folder_filter=spec.dev, split="test"
+            )
+            selection_name = "dev"
+            print(f"Checkpoint selection uses DEV folders from {spec.path}")
+        except Exception as exc:
+            print(f"WARNING: DEV split unavailable ({exc}); selecting on validation.")
 
     print(
         f"\nTraining batches: {_loader_batches(train_loader, args, 'train')}"
@@ -1962,59 +2089,40 @@ def run_stage1(
 
             scheduler.step()
 
+            sel_score, sel_metrics = score_checkpoint(
+                args, model, device, "stage1", val_metrics, selection_loader, selection_name
+            )
             record = {
                 "epoch": epoch,
                 "train": train_metrics,
                 "val": val_metrics,
+                "selection": sel_metrics,
             }
-
             history.append(record)
-
             print(
                 f"\n[Stage1 Epoch {epoch}/{args.epochs}] "
                 f"train loss={train_metrics['loss']:.4f} "
                 f"acc={train_metrics['acc']:.4f} | "
                 f"val loss={val_metrics['loss']:.4f} "
-                f"acc={val_metrics['acc']:.4f}"
+                f"acc={val_metrics['acc']:.4f} | "
+                f"{selection_name}_score={sel_score:.4f}"
             )
 
-            # ----------------------------------------------------
-            # Save last checkpoint every epoch (so a later run can resume)
-            # ----------------------------------------------------
-
-            save_checkpoint(
-                last_path,
-                model,
-                optimizer,
-                epoch,
-                val_metrics,
-                "stage1",
-                args,
-                scheduler=scheduler,
-                best_acc=best_acc,
-            )
-
-            # ----------------------------------------------------
-            # Save best checkpoint
-            # ----------------------------------------------------
-
-            if val_metrics["acc"] > best_acc:
-
-                best_acc = val_metrics["acc"]
-
+            def _save(path):
                 save_checkpoint(
-                    best_path,
-                    model,
-                    optimizer,
-                    epoch,
-                    val_metrics,
-                    "stage1",
-                    args,
-                    scheduler=scheduler,
-                    best_acc=best_acc,
+                    path, model, optimizer, epoch, sel_metrics, "stage1", args,
+                    scheduler=scheduler, best_acc=best_acc,
                 )
 
-            if early_stopper.step(val_metrics["acc"], epoch):
+            _save(last_path)
+            save_epoch_snapshot(
+                Path(args.output_dir), "stage1", epoch,
+                getattr(args, "keep_last_epochs", 0), _save, rotate_epoch_checkpoints,
+            )
+            if sel_score > best_acc:
+                best_acc = sel_score
+                _save(best_path)
+            if early_stopper.step(sel_score, epoch):
                 break
 
     # --------------------------------------------------------
@@ -2026,11 +2134,13 @@ def run_stage1(
 
     ckpt = torch.load(best_path, map_location=device, weights_only=False)
     model.load_state_dict(ckpt["model_state_dict"])
-    test_metrics = eval_stage1(model, test_loader, criterion, device)
+    headline_loader, headline_name = report_eval_loader(args, device, test_loader)
+    test_metrics = eval_stage1(model, headline_loader, criterion, device)
+    test_metrics["split"] = headline_name
 
     history_path = Path(args.output_dir) / "stage1_history.json"
     with open(history_path, "w") as f:
-        json.dump({"epochs": history, "test": test_metrics, "best_val_acc": best_acc}, f, indent=2)
+        json.dump({"epochs": history, "test": test_metrics, "best_selection_score": best_acc}, f, indent=2)
 
     print("\n")
     print("=" * 60)
@@ -2058,6 +2168,7 @@ def run_hybrid(
     train_loader, val_loader = build_loaders(
         args, device
     )
+    selection_loader, selection_name = resolve_selection_loader(args, device, val_loader)
 
     print(
         f"\nTraining batches: {_loader_batches(train_loader, args, 'train')}"

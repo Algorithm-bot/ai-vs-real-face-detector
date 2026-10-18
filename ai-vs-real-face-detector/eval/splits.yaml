@@ -1,0 +1,118 @@
+# DEV / REPORT partition of the ForenSynths (CNNDetection) test suite.
+#
+# Total 42 source folders = 20 ProGAN classes + 22 cross-generator folders.
+#
+# Protocol:
+#   FOLD_A: 14 folders (38,437 images in standard ForenSynths)
+#   FOLD_B: 8 folders (43,848 images in standard ForenSynths)
+#   PROGAN: 20 folders (7,960 images), reported separately as seen generator.
+#
+# Epoch/checkpoint selection is performed on FOLD_A.
+# Threshold applied to FOLD_B is fitted on FOLD_A (headline numbers reported on FOLD_B).
+# Threshold applied to FOLD_A is fitted on FOLD_B (reported labelled "used for epoch selection").
+# CRN and IMLE are kept in the same fold (FOLD_B) as they share real images.
+
+all_folders:
+  # 20 ProGAN folders
+  - progan/airplane
+  - progan/bicycle
+  - progan/bird
+  - progan/boat
+  - progan/bottle
+  - progan/bus
+  - progan/car
+  - progan/cat
+  - progan/chair
+  - progan/cow
+  - progan/diningtable
+  - progan/dog
+  - progan/horse
+  - progan/motorbike
+  - progan/person
+  - progan/pottedplant
+  - progan/sheep
+  - progan/sofa
+  - progan/train
+  - progan/tvmonitor
+  # FOLD_A folders
+  - stylegan/bedroom
+  - stylegan/car
+  - stylegan/cat
+  - gaugan
+  - cyclegan/apple
+  - cyclegan/horse
+  - cyclegan/orange
+  - cyclegan/summer
+  - cyclegan/winter
+  - cyclegan/zebra
+  - san
+  - deepfake
+  - biggan
+  - stargan
+  # FOLD_B folders
+  - stylegan2/car
+  - stylegan2/cat
+  - stylegan2/church
+  - stylegan2/horse
+  - crn
+  - imle
+  - seeingdark
+  - whichfaceisreal
+
+fold_a:
+  - stylegan/bedroom
+  - stylegan/car
+  - stylegan/cat
+  - gaugan
+  - cyclegan/apple
+  - cyclegan/horse
+  - cyclegan/orange
+  - cyclegan/summer
+  - cyclegan/winter
+  - cyclegan/zebra
+  - san
+  - deepfake
+  - biggan
+  - stargan
+
+fold_b:
+  - stylegan2/car
+  - stylegan2/cat
+  - stylegan2/church
+  - stylegan2/horse
+  - crn
+  - imle
+  - seeingdark
+  - whichfaceisreal
+
+progan:
+  - progan
+
+# Backwards compatibility / default mapping:
+# dev maps to fold_a (used for epoch/checkpoint selection)
+# report maps to fold_b (headline report set)
+dev:
+  - stylegan/bedroom
+  - stylegan/car
+  - stylegan/cat
+  - gaugan
+  - cyclegan/apple
+  - cyclegan/horse
+  - cyclegan/orange
+  - cyclegan/summer
+  - cyclegan/winter
+  - cyclegan/zebra
+  - san
+  - deepfake
+  - biggan
+  - stargan
+
+report:
+  - stylegan2/car
+  - stylegan2/cat
+  - stylegan2/church
+  - stylegan2/horse
+  - crn
+  - imle
+  - seeingdark
+  - whichfaceisreal
