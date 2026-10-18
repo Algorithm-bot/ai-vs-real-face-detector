@@ -111,14 +111,20 @@ class FreqExtractor:
 
     def extract(self, image: np.ndarray) -> FreqResult:
         """
-        Extract 64-d frequency artifact vector from full-resolution image.
+        Extract 64-d frequency artifact vector from unresized center 224x224 crop.
         NaN/inf safe, float32 output.
         """
+        from src.preprocess import center_crop_numpy, DEFAULT_CROP_SIZE
+
         # Ensure 3-channel RGB
         if image.ndim == 2:
             image = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
         elif image.shape[2] == 4:
             image = image[:, :, :3]
+
+        h, w = image.shape[:2]
+        if h != DEFAULT_CROP_SIZE or w != DEFAULT_CROP_SIZE:
+            image = center_crop_numpy(image, DEFAULT_CROP_SIZE)
 
         h, w = image.shape[:2]
         gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY).astype(np.float32)

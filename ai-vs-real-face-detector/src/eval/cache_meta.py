@@ -44,6 +44,8 @@ def requested_meta_from_args(args: Any) -> Dict[str, Any]:
         "crop_size": "crop_size",
         "augment": "augment",
         "branches": "branches",
+        "max_train_images": "max_train_images",
+        "max_train_per_class": "max_train_per_class",
     }
     for attr, key in mapping.items():
         if hasattr(args, attr) and getattr(args, attr) not in (None, ""):

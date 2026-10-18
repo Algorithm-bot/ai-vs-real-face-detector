@@ -196,6 +196,8 @@ def main():
     ap.add_argument("--cache-dir", required=True)
     ap.add_argument("--max-train-per-class", type=int, default=0,
                     help="Same meaning as train.py; use the SAME value so subsets match. 0 = all.")
+    ap.add_argument("--max-train-images", type=int, default=0,
+                    help="Cap total train images, balanced per class (N//2 real, N//2 fake), seeded. 0 = all.")
     ap.add_argument("--workers", type=int, default=max((os.cpu_count() or 4) - 2, 1))
     ap.add_argument("--shard-size", type=int, default=20000)
     ap.add_argument("--semantic-model", default=DEFAULT_VIT_MODEL)
@@ -229,6 +231,10 @@ def main():
 
     from src.freq_branch.extractor import FREQ_FEATURE_DIM
 
+    effective_per_class = args.max_train_per_class
+    if args.max_train_images > 0:
+        effective_per_class = max(1, args.max_train_images // 2)
+
     meta = {
         "semantic_model": args.semantic_model,
         "semantic_pretrained": not args.no_semantic_pretrained,
@@ -237,7 +243,8 @@ def main():
         "prnu_dim": PRNU_FEATURE_DIM,
         "freq_dim": FREQ_FEATURE_DIM,
         "semantic_dim": int(encoder.embedding_dim),
-        "max_train_per_class": args.max_train_per_class,
+        "max_train_images": args.max_train_images,
+        "max_train_per_class": effective_per_class,
         "preprocess": args.preprocess,
         "crop_size": 224,
         "augment": bool(args.augment),
@@ -264,10 +271,10 @@ def main():
             )
         if not samples:
             raise FileNotFoundError(f"No images under {Path(args.data_dir) / split}")
-        if split == "train" and args.max_train_per_class > 0:
+        if split == "train" and (args.max_train_images > 0 or args.max_train_per_class > 0):
             before = len(samples)
-            samples = subsample_balanced(samples, args.max_train_per_class, args.seed)
-            print(f"[train] subset {before} -> {len(samples)} images")
+            samples = subsample_balanced(samples, effective_per_class, args.seed)
+            print(f"[train] subset {before} -> {len(samples)} images (max_train_images={args.max_train_images}, per_class={effective_per_class})")
         process_split(split, samples, encoder, device, cache_dir, args)
 
     print("Feature cache complete:", cache_dir)

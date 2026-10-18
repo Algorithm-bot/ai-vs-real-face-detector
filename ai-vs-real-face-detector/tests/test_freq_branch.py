@@ -44,6 +44,40 @@ def test_freq_extractor_dimensions_and_subcomponents():
         assert np.all(np.isfinite(npr))
 
 
+def test_freq_extractor_identical_for_same_center_crop_across_resolutions():
+    """Verify that images of different sizes with the same center 224x224 crop yield identical freq vectors."""
+    extractor = FreqExtractor()
+    rng = np.random.RandomState(42)
+
+    # 1. Base 224x224 patch
+    patch_224 = rng.randint(0, 256, (224, 224, 3), dtype=np.uint8)
+
+    # 2. Embed into 256x256
+    img_256 = rng.randint(0, 256, (256, 256, 3), dtype=np.uint8)
+    sy_256, sx_256 = (256 - 224) // 2, (256 - 224) // 2
+    img_256[sy_256 : sy_256 + 224, sx_256 : sx_256 + 224] = patch_224
+
+    # 3. Embed into 512x384
+    img_512x384 = rng.randint(0, 256, (512, 384, 3), dtype=np.uint8)
+    sy_rect, sx_rect = (512 - 224) // 2, (384 - 224) // 2
+    img_512x384[sy_rect : sy_rect + 224, sx_rect : sx_rect + 224] = patch_224
+
+    # 4. Embed into 1024x1024
+    img_1024 = rng.randint(0, 256, (1024, 1024, 3), dtype=np.uint8)
+    sy_1024, sx_1024 = (1024 - 224) // 2, (1024 - 224) // 2
+    img_1024[sy_1024 : sy_1024 + 224, sx_1024 : sx_1024 + 224] = patch_224
+
+    v_224 = extractor.extract(patch_224).vector
+    v_256 = extractor.extract(img_256).vector
+    v_512x384 = extractor.extract(img_512x384).vector
+    v_1024 = extractor.extract(img_1024).vector
+
+    assert np.allclose(v_224, v_256), "Freq vector mismatch between 224x224 and 256x256 center crop"
+    assert np.allclose(v_224, v_512x384), "Freq vector mismatch between 224x224 and 512x384 center crop"
+    assert np.allclose(v_224, v_1024), "Freq vector mismatch between 224x224 and 1024x1024 center crop"
+    assert np.allclose(v_256, v_1024), "Freq vector mismatch between 256x256 and 1024x1024 center crop"
+
+
 def test_freq_extractor_edge_cases_nan_inf_safety():
     extractor = FreqExtractor()
 

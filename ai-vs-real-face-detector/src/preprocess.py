@@ -19,14 +19,17 @@ IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 DEFAULT_CROP_SIZE = 224
 
-# Frequency branch rule: Always extract from full-resolution raw image before 224 crop
-# to preserve native sampling artifacts, checkerboards, and periodic peaks.
-def preprocess_for_freq(image: np.ndarray) -> np.ndarray:
-    """Preprocess image for frequency branch: uses full-resolution uncropped image."""
+# Frequency branch rule: Always extract from the unresized center 224x224 crop
+# from src/preprocess.py to maintain consistency across resolutions.
+def preprocess_for_freq(image: np.ndarray, crop_size: int = DEFAULT_CROP_SIZE) -> np.ndarray:
+    """Preprocess image for frequency branch: uses unresized center 224x224 crop."""
     if image.ndim == 2:
         image = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
     elif image.shape[2] == 4:
         image = image[:, :, :3]
+    h, w = image.shape[:2]
+    if h != crop_size or w != crop_size:
+        image = center_crop_numpy(image, crop_size=crop_size)
     return image
 
 

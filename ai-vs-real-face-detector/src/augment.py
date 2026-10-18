@@ -75,16 +75,23 @@ def augment_raw_image(
     epoch: int = 0,
     base_seed: int = 42,
     enable_augment: bool = True,
+    deterministic: bool = True,
 ) -> Tuple[np.ndarray, np.random.RandomState]:
     """
-    Deterministically augment raw image before cropping.
+    Augment raw image before cropping.
+    If deterministic=True: uses path_to_seed(path, epoch, base_seed) so cached and live match.
+    If deterministic=False: draws fresh random blur/JPEG per epoch (fresh RNG).
     Returns (augmented_image, crop_rng).
     """
     if not enable_augment:
-        rng = np.random.RandomState(path_to_seed(path, epoch, base_seed)) if path else np.random.RandomState()
+        rng = np.random.RandomState(path_to_seed(path, epoch, base_seed)) if (deterministic and path) else np.random.RandomState()
         return image, rng
 
-    seed = path_to_seed(path, epoch, base_seed) if path else base_seed
-    rng = np.random.RandomState(seed)
+    if deterministic and path:
+        seed = path_to_seed(path, epoch, base_seed)
+        rng = np.random.RandomState(seed)
+    else:
+        rng = np.random.RandomState()
+
     augmented = apply_blur_jpeg_augmentation(image, rng=rng)
     return augmented, rng

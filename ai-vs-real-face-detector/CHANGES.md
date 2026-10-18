@@ -164,30 +164,64 @@ To reproduce legacy behavior and evaluate older checkpoints trained on the 1,695
 
 ---
 
-## 4. Unverified GPU Items (Deferred to Kaggle Verification)
+## 4. Unverified GPU Items & Kaggle Notebook Migration
 
-The following items cannot be fully verified locally without GPU accelerators and Kaggle dataset storage:
-1. **Full Kaggle Dataset Image Counts**: Exact per-folder image counts vs `eval/expected_counts.json` (90,245 total images).
-2. **Kaggle GPU Memory & Throughput under Full Dataset**:
+### A. Notebook Migration Guide (`notebooks/kaggle_train.ipynb`)
+To run on Kaggle with the new architecture:
+1. **Update Clone Cell (Cell 2)**:
+   Change the git clone command to pull the new evaluation overhaul branch:
+   ```python
+   subprocess.run([
+       "git", "clone",
+       "--depth", "1",
+       "--branch", "hybrid-detector-eval-overhaul",
+       GITHUB_REPO_URL,
+       str(clone_dir)
+   ], check=True)
+   ```
+2. **Delete Legacy Monkey-Patch Cells**:
+   The following notebook cells applied temporary monkey-patches that are now natively integrated into the repository. **Delete these cells entirely**:
+   - **Cell 2b / Patch Cell 3** (`Make stage1 (deep branch) fully resumable`): Native per-epoch atomic saving with `stage1_history_partial.json` and resilient checkpointing are now in `src/train.py`.
+   - **Cell 2c / Patch Cell 4** (`Blur+JPEG augmentation for all branches`): Pre-crop Blur+JPEG augmentation is now in `src/augment.py` and natively invoked by `src/cache_features.py` and `src/train.py`.
+   - **Cell 4c / Patch Cell 8** (`Launcher for train_cached.py that fits scalers from cache`): Fast scaler fitting directly from cached `.npz` files is built into `src/train_cached.py`.
+3. **Run Verification Cell**:
+   Add a cell immediately after cloning to run `kaggle_verify.py` and verify environment and dataset integrity before starting training or caching:
+   ```python
+   !python kaggle_verify.py --data-dir $KAGGLE_DATASET_MOUNT --feature-cache /kaggle/working/feature_cache
+   ```
+
+### B. Unverified Items Deferred to Kaggle
+The following items cannot be fully verified locally without GPU accelerators and the real Kaggle dataset storage:
+1. **Full Kaggle Dataset Image Counts**: Exact per-folder image counts vs `eval/expected_counts.json` (90,245 total images across 42 folders).
+2. **Kaggle GPU Memory & Real Throughput**:
    - EfficientNet-B0 stride 1 vs stride 2 across 90k images.
-   - Batch fp16 extraction speed of CLIP ViT-L/14 with Kaggle's dual T4 or P100 GPUs.
-3. **Pretrained Weights Checksum Verification**: Actual download and validation of `vit_large_patch14_clip_224.openai` on Kaggle's network.
-4. **End-to-End Real Image Feature Parity**: 20 real ForenSynths images drawn from `crn`, `stylegan_car`, `whichfaceisreal`, and `progan_car`.
-
-*To verify all deferred items, run the unified verification script on Kaggle:*
-```python
-!python kaggle_verify.py --data-dir /kaggle/input/forensynths --feature-cache /kaggle/working/feature_cache
-```
+   - Batch fp16 extraction speed of CLIP ViT-L/14 with Kaggle's T4 or P100 GPUs.
+3. **Pretrained Weights Checksum & Internet Download**: Actual download and validation of `vit_large_patch14_clip_224.openai` via `timm` (requires notebook internet enabled).
+4. **End-to-End Real Image Parity**: Exact `np.allclose` tolerance check on 20 real ForenSynths images drawn from `crn`, `stylegan_car`, `whichfaceisreal`, and `progan_car`.
 
 ---
 
 ## 5. Compute Cost & Resource Estimates
 
+### A. Cache Rebuild Time Formula
+The total cache rebuild time depends on whether the GPU or CPU pipeline is the bottleneck:
+$$\text{Time (hours)} = \frac{N_{\text{images}}}{3600 \times \min\left(\text{Throughput}_{\text{CLIP}}, \, N_{\text{workers}} \times \text{Throughput}_{\text{Freq+Physics}}\right)}$$
+
+- $N_{\text{images}} = 90{,}245$ (for the entire ForenSynths suite).
+- $\text{Throughput}_{\text{CLIP}}$: Measured in img/s on GPU (e.g. ~35–45 img/s on T4 in fp16 with batch size 64).
+- $\text{Throughput}_{\text{Freq+Physics}}$: Measured in img/s per CPU core (e.g. ~16 img/s per core).
+- With 2–3 CPU workers on Kaggle:
+  $$\text{Effective Throughput} \approx \min(40, 2 \times 16) \approx 32\text{ img/s}$$
+  $$\text{Total Time} \approx \frac{90{,}245}{3600 \times 32} \approx 0.78\text{ hours (~47 minutes)}$$
+- If throughput on Kaggle is constrained, use `--max-train-images N` (e.g. `--max-train-images 10000`) on `src/cache_features.py` to balance and cap the training subset.
+
+### B. Component Resource Breakdown
+
 | Component | Hardware | Memory (VRAM) | Estimated Throughput / Time |
 | :--- | :--- | :--- | :--- |
 | **EfficientNet-B0 (default stride 2)** | NVIDIA T4 / RTX | ~1.2 GB | ~385 img/s (~4 mins for 90k images) |
 | **EfficientNet-B0 (`--deep-no-down` stride 1)** | NVIDIA T4 / RTX | ~4.7 GB | ~35 img/s (~42 mins for 90k images) |
-| **CLIP ViT-L/14 (fp16, batch size 64)** | NVIDIA T4 / RTX | ~2.3 GB | ~8.5-40 img/s (~40-90 mins for 90k images) |
-| **Frequency Branch Extraction (CPU)** | 1 CPU Core | < 100 MB | ~15-20 img/s (vectorized NumPy) |
-| **Full Hybrid Cache Generation** | 1x T4 + 2 CPU Workers | ~3.5 GB | ~1.5 - 2.0 hours total for ForenSynths |
+| **CLIP ViT-L/14 (fp16, batch size 64)** | NVIDIA T4 / RTX | ~2.3 GB | ~35-45 img/s (~35-45 mins for 90k images) |
+| **Frequency Branch Extraction (CPU)** | 1 CPU Core | < 100 MB | ~16 img/s (vectorized NumPy) |
+| **Full Hybrid Cache Generation** | 1x T4 + 2 CPU Workers | ~3.5 GB | ~1.0 - 1.5 hours total for ForenSynths |
 | **Stacking Logistic Regression (DEV)** | CPU | < 500 MB | < 15 seconds |

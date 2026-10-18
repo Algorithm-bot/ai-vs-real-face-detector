@@ -399,11 +399,18 @@ def process_face_sample(
     from src.augment import augment_raw_image
     from src.preprocess import PreprocessPipeline
 
-    # Item 2b: Training augmentation (Blur+JPEG) applied at raw resolution BEFORE crop
-    # Deterministic per-path seeding ensures cached and live branches see identical pixels
+    # Request 2: With feature cache attached, use deterministic per-path seeding (epoch=0)
+    # so live deep branch sees the exact same augmented pixels as cached auxiliary features.
+    # With NO feature cache attached, draw fresh random blur/JPEG per epoch.
     if enable_augment:
+        has_cache = (cached is not None)
         rgb, crop_rng = augment_raw_image(
-            rgb, path=path, epoch=epoch, base_seed=seed, enable_augment=True
+            rgb,
+            path=path if has_cache else "",
+            epoch=0 if has_cache else epoch,
+            base_seed=seed,
+            enable_augment=True,
+            deterministic=has_cache,
         )
     else:
         crop_rng = None
@@ -1238,15 +1245,19 @@ def build_loaders(args, device: torch.device, folder_filter: Optional[List[str]]
 
     train_ds = make_timed_dataset("train", get_train_transforms())
 
-    if not streaming and getattr(args, "max_train_per_class", 0) > 0:
+    effective_cap = getattr(args, "max_train_per_class", 0)
+    if getattr(args, "max_train_images", 0) > 0:
+        effective_cap = max(1, args.max_train_images // 2)
+
+    if not streaming and effective_cap > 0:
         before = len(train_ds.samples)
         train_ds.samples = subsample_balanced(
-            train_ds.samples, args.max_train_per_class, args.seed
+            train_ds.samples, effective_cap, args.seed
         )
         print(f"Training subset: {before} -> {len(train_ds.samples)} images "
-              f"(max {args.max_train_per_class} per class)")
-    elif streaming and getattr(args, "max_train_per_class", 0) > 0:
-        print("WARNING: --max-train-per-class is ignored for hf-stream datasets.")
+              f"(max_train_images={getattr(args, 'max_train_images', 0)}, max {effective_cap} per class)")
+    elif streaming and effective_cap > 0:
+        print("WARNING: --max-train-images / --max-train-per-class is ignored for hf-stream datasets.")
 
     # --------------------------------------------------------
     # Validation dataset
@@ -3300,6 +3311,15 @@ def parse_args():
             "TRAIN images (val/test are untouched). 0 = use everything."
         ),
     )
+    parser.add_argument(
+        "--max-train-images",
+        type=int,
+        default=0,
+        help=(
+            "If > 0, randomly keep at most this many total TRAIN images, "
+            "balanced per class (N//2 real, N//2 fake), seeded. 0 = use everything."
+        ),
+    )
 
     parser.add_argument(
         "--feature-cache",
@@ -3411,8 +3431,16 @@ def main() -> None:
     print("Seed:", args.seed)
     print("Scaler samples:", args.scaler_samples, "(0 = all training images)")
     print("Fresh start (ignore existing checkpoint):", args.fresh)
-
+    print("Deep no-down (stem stride 1):", args.deep_no_down)
     print("=" * 60)
+
+    if getattr(args, "deep_no_down", False):
+        print("\n" + "!" * 70)
+        print("WARNING: --deep-no-down is ENABLED (EfficientNet stem stride 1 instead of 2).")
+        print("  - VRAM usage will increase significantly (~4.7 GB vs ~1.2 GB).")
+        print("  - Throughput drops ~10x (~35 img/s vs ~385 img/s on NVIDIA T4 GPU).")
+        print("  - Estimated epoch time for 72k train images: ~34 minutes/epoch (vs ~3 mins/epoch).")
+        print("!" * 70 + "\n")
 
     # --------------------------------------------------------
     # Run selected mode
