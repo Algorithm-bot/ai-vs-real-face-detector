@@ -1,7 +1,13 @@
 import json
+import shutil
+import numpy as np
+import torch
 
 from src import cache_features
 from src.train import FaceBinaryDataset
+from src.physics_branch.feature_vector import PHYSICS_FEATURE_DIM
+from src.prnu_branch.extractor import PRNU_FEATURE_DIM
+from src.freq_branch.extractor import FREQ_FEATURE_DIM
 
 
 def test_main_reuses_cached_file_list(tmp_path, monkeypatch):
@@ -122,6 +128,7 @@ def test_collect_labeled_images_reports_enumeration_progress(tmp_path, capsys):
     assert samples == [(str(image_path), 0, "source-099")]
     assert "processed 100 directories" in capsys.readouterr().out
 
+
 def test_exclude_ffhq_from_splits(tmp_path, monkeypatch):
     # Create synthetic dataset with ffhq folders in train, val, test
     for split in ("train", "val", "test"):
@@ -150,3 +157,100 @@ def test_exclude_ffhq_from_splits(tmp_path, monkeypatch):
             assert source != "ffhq", f"Found ffhq in source: {source} for path {path}"
         # Also ensure we have some samples (the non-ffhq ones)
         assert len(samples) > 0, f"No samples found in split {split}"
+
+
+def test_process_split_creates_shard_dir_if_missing_after_compute(tmp_path, monkeypatch):
+    """Test that shard directory is created if missing after compute step."""
+    # Setup
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    split = "train"
+    # Create a few samples
+    samples = [("img1.jpg", 0, "source1"), ("img2.jpg", 1, "source2")]
+    # Create a mock args object
+    class Args:
+        batch_size = 2
+        workers = 0
+        shard_size = 2  # so we have one shard
+        seed = 42
+        augment = False
+        preprocess = "crop"
+    args = Args()
+
+    # Mock encoder
+    class DummyEncoder:
+        embedding_dim = 4  # must match the dummy extractor output? We'll adjust
+        mean = np.array([0.5, 0.5, 0.5])
+        std = np.array([0.5, 0.5, 0.5])
+
+        def eval(self):
+            return self
+
+        def __call__(self, x):
+            # Return dummy embeddings of shape (batch_size, embedding_dim)
+            return torch.ones((x.shape[0], self.embedding_dim), dtype=torch.float32)
+
+    # Mock FeatureDataset to return dummy tensors
+    class MockFeatureDataset:
+        def __init__(self, samples, preprocess_mode="crop", crop_size=224, enable_augment=False, seed=42):
+            self.samples = samples
+            self.preprocess_mode = preprocess_mode
+            self.crop_size = crop_size
+            self.enable_augment = enable_augment
+            self.seed = seed
+
+        def __len__(self):
+            return len(self.samples)
+
+        def __getitem__(self, idx):
+            # Return dummy tensors: physics, prnu, freq, sem, ok
+            return (
+                torch.ones(PHYSICS_FEATURE_DIM, dtype=torch.float32),
+                torch.ones(PRNU_FEATURE_DIM, dtype=torch.float32),
+                torch.ones(FREQ_FEATURE_DIM, dtype=torch.float32),
+                torch.ones(224, 224, 3, dtype=torch.uint8),
+                torch.tensor(1, dtype=torch.int8),
+            )
+
+    # Now monkeypatch the dependencies
+    monkeypatch.setattr(cache_features.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(cache_features, "SemanticEncoder", lambda **kwargs: DummyEncoder())
+    monkeypatch.setattr(cache_features, "FeatureDataset", MockFeatureDataset)
+
+    # We also need to mock the DataLoader to avoid using multiple workers and to return our data in a single batch
+    # We'll create a mock dataset that wraps the MockFeatureDataset? Actually, the DataLoader will use our mocked FeatureDataset.
+    # We'll mock the DataLoader class to return an iterator that yields a single batch containing all the samples.
+    class MockDataLoader:
+        def __init__(self, dataset, batch_size, shuffle, num_workers, pin_memory, prefetch_factor):
+            self.dataset = dataset
+            self.batch_size = batch_size
+
+        def __iter__(self):
+            # Collect all items in the dataset
+            batch = [self.dataset[i] for i in range(len(self.dataset))]
+            # Now we need to collate the batch: we'll stack each component
+            physics_batch = torch.stack([item[0] for item in batch])
+            prnu_batch = torch.stack([item[1] for item in batch])
+            freq_batch = torch.stack([item[2] for item in batch])
+            sem_batch = torch.stack([item[3] for item in batch])
+            ok_batch = torch.stack([item[4] for item in batch])
+            # Yield a single batch
+            yield (physics_batch, prnu_batch, freq_batch, sem_batch, ok_batch)
+
+    monkeypatch.setattr(cache_features, "DataLoader", MockDataLoader)
+
+    # Now we need to remove the shard directory after the compute loop and before the save.
+    # We'll remove the shard directory before calling process_split and see if it still works.
+    # (Our function has mkdir at the start and before each save, so it should recreate it.)
+
+    shard_dir = cache_dir / f"{split}_shards"
+    # Ensure the shard directory does not exist
+    if shard_dir.exists():
+        shutil.rmtree(shard_dir)
+
+    # Call process_split
+    cache_features.process_split(split, samples, DummyEncoder(), torch.device("cuda"), cache_dir, args)
+
+    # Check that the shard file was created
+    shard_file = shard_dir / "00000.npz"
+    assert shard_file.exists(), "Shard file was not created"

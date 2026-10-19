@@ -129,6 +129,7 @@ def process_split(split, samples, encoder, device, cache_dir, args):
         print(f"[{split}] already cached -> {final}")
         return
     shard_dir = cache_dir / f"{split}_shards"
+    shard_dir.mkdir(parents=True, exist_ok=True)
     batch_size = getattr(args, "batch_size", 64)
     mean = torch.tensor(encoder.mean, device=device).view(1, 3, 1, 1)
     std = torch.tensor(encoder.std, device=device).view(1, 3, 1, 1)
@@ -160,16 +161,58 @@ def process_split(split, samples, encoder, device, cache_dir, args):
                 s = encoder(x).float().cpu().numpy()
             phys.append(p.numpy()); prnu.append(q.numpy()); freqs.append(f.numpy()); sem.append(s); oks.append(ok.numpy())
 
-        tmp = shard_dir / f"{k:05d}.tmp.npz"
-        np.savez(
-            tmp,
-            paths=np.array([s[0] for s in chunk]),
-            labels=np.array([s[1] for s in chunk], dtype=np.int8),
-            sources=np.array([s[2] for s in chunk]),
-            physics=np.concatenate(phys), prnu=np.concatenate(prnu),
-            freq=np.concatenate(freqs),
-            semantic=np.concatenate(sem), ok=np.concatenate(oks).astype(bool),
-        )
+        max_attempts = 3
+        saved = False
+        last_exc = None
+        for attempt in range(max_attempts):
+            tmp = shard_dir / f"{k:05d}.tmp.npz"
+            try:
+                np.savez(
+                    tmp,
+                    paths=np.array([s[0] for s in chunk]),
+                    labels=np.array([s[1] for s in chunk], dtype=np.int8),
+                    sources=np.array([s[2] for s in chunk]),
+                    physics=np.concatenate(phys), prnu=np.concatenate(prnu),
+                    freq=np.concatenate(freqs),
+                    semantic=np.concatenate(sem), ok=np.concatenate(oks).astype(bool),
+                )
+                # Check that we can load it
+                with np.load(tmp) as data:
+                    # Just opening to check
+                    pass
+                saved = True
+                break
+            except Exception as e:
+                last_exc = e
+                # If we want to wait, we could time.sleep, but not specified.
+                continue
+
+        if not saved:
+            # Try rescue
+            rescue_dir = Path("/kaggle/working")
+            rescue_dir.mkdir(parents=True, exist_ok=True)
+            rescue_path = rescue_dir / f"shard_rescue_{split}_{k:05d}.npz"
+            try:
+                np.savez(
+                    rescue_path,
+                    paths=np.array([s[0] for s in chunk]),
+                    labels=np.array([s[1] for s in chunk], dtype=np.int8),
+                    sources=np.array([s[2] for s in chunk]),
+                    physics=np.concatenate(phys), prnu=np.concatenate(prnu),
+                    freq=np.concatenate(freqs),
+                    semantic=np.concatenate(sem), ok=np.concatenate(oks).astype(bool),
+                )
+                with np.load(rescue_path) as data:
+                    pass
+                # Rescue succeeded, now move it to the shard directory as the tmp file
+                shard_dir.mkdir(parents=True, exist_ok=True)
+                os.replace(rescue_path, tmp)
+                saved = True
+            except Exception as e:
+                print(f"[{split}] ERROR: Failed to save shard {k} even to rescue path: {e}")
+                raise last_exc
+
+        # Now we have tmp in shard_dir (either from direct or rescue)
         os.replace(tmp, shard)
 
     parts = [np.load(shard_dir / f"{k:05d}.npz") for k in range(n_shards)]
