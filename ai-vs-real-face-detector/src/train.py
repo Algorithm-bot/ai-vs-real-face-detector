@@ -74,6 +74,8 @@ class EarlyStopping:
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
+EXCLUDE_SOURCES = ("ffhq",)
+
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -370,9 +372,10 @@ def collect_labeled_images(split_root: Path) -> List[Tuple[str, int, str]]:
     if _has_explicit_label_dirs(split_root):
         _collect_under_label_root(split_root / "real", 0, "lsun", samples, seen)
         _collect_under_label_root(split_root / "fake", 1, "synthetic", samples, seen)
-        return samples
-
-    return _collect_cnndetection_images(split_root)
+    else:
+        samples = _collect_cnndetection_images(split_root)
+    # Filter out excluded sources
+    return [s for s in samples if s[2] not in EXCLUDE_SOURCES]
 
 
 def process_face_sample(
@@ -3385,6 +3388,13 @@ def parse_args():
         help="Directory written by src/cache_features.py. Physics/PRNU/ViT vectors are "
              "read from it instead of being recomputed for every image every epoch.",
     )
+    parser.add_argument(
+        "--exclude-sources",
+        type=str,
+        default="ffhq",
+        help="Comma-separated list of source folders to exclude from all splits. "
+             "Recorded in cache meta.json; trainers refuse a cache with a different list.",
+    )
 
     parser.add_argument(
         "--fast",
@@ -3436,6 +3446,8 @@ def main() -> None:
         raise ValueError("Known streamed train/val/test sizes must each be at least one batch.")
     if args.scaler_samples < 0:
         raise ValueError("--scaler-samples must be >= 0 (0 means all training images).")
+    global EXCLUDE_SOURCES
+    EXCLUDE_SOURCES = tuple(s.strip() for s in args.exclude_sources.split(",") if s.strip())
 
     set_seed(
         args.seed

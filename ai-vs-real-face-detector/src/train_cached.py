@@ -82,6 +82,7 @@ def evaluate(model, X, y, sources=None, bs=8192):
 
 def main():
     args = T.parse_args()
+    T.EXCLUDE_SOURCES = tuple(s.strip() for s in args.exclude_sources.split(",") if s.strip())
     mode = args.mode
     if mode not in KEY:
         sys.exit("train_cached.py handles physics_only / prnu_only / semantic_only. "

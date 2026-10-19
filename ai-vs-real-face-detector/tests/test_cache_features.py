@@ -121,3 +121,32 @@ def test_collect_labeled_images_reports_enumeration_progress(tmp_path, capsys):
 
     assert samples == [(str(image_path), 0, "source-099")]
     assert "processed 100 directories" in capsys.readouterr().out
+
+def test_exclude_ffhq_from_splits(tmp_path, monkeypatch):
+    # Create synthetic dataset with ffhq folders in train, val, test
+    for split in ("train", "val", "test"):
+        split_dir = tmp_path / split
+        for label in ("real", "fake"):
+            label_dir = split_dir / label
+            # Create an ffhq subdirectory
+            ffhq_dir = label_dir / "ffhq"
+            ffhq_dir.mkdir(parents=True)
+            # Create a dummy image inside ffhq
+            (ffhq_dir / "img.jpg").write_bytes(b"fake")
+            # Also create a non-ffhq image directly under label dir to ensure we have some data
+            (label_dir / "other.jpg").write_bytes(b"real")
+
+    # Import and set EXCLUDE_SOURCES
+    from src.train import EXCLUDE_SOURCES, collect_labeled_images
+    # Save original to restore after test? We'll use monkeypatch to set it.
+    monkeypatch.setattr("src.train.EXCLUDE_SOURCES", ("ffhq",))
+
+    # Check each split
+    for split in ("train", "val", "test"):
+        split_root = tmp_path / split
+        samples = collect_labeled_images(split_root)
+        # Ensure no sample has source equal to "ffhq"
+        for path, label, source in samples:
+            assert source != "ffhq", f"Found ffhq in source: {source} for path {path}"
+        # Also ensure we have some samples (the non-ffhq ones)
+        assert len(samples) > 0, f"No samples found in split {split}"

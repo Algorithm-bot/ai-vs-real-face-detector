@@ -50,6 +50,7 @@ from src.semantic_branch.encoder import (
     IMAGENET_STD,
     SemanticEncoder,
 )
+import src.train
 
 
 def _prnu_view(rgb, m=256):
@@ -216,8 +217,12 @@ def main():
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--subset-seed", type=int, default=42,
                     help="Random seed used only for balanced subset selection; training seed remains for init/order.")
+    ap.add_argument("--exclude-sources", type=str, default="ffhq",
+                    help="Comma-separated list of source folders to exclude from all splits. "
+                         "Recorded in cache meta.json; trainers refuse a cache with a different list.")
     ap.add_argument("--force", action="store_true")
     args = ap.parse_args()
+    src.train.EXCLUDE_SOURCES = tuple(s.strip() for s in args.exclude_sources.split(",") if s.strip())
 
     if not torch.cuda.is_available():
         raise RuntimeError("Need a GPU for the ViT pass.")
@@ -255,6 +260,7 @@ def main():
         "augment": bool(args.augment),
         "seed": args.seed,
         "subset_seed": getattr(args, "subset_seed", args.seed),
+        "exclude_sources": tuple(s.strip() for s in args.exclude_sources.split(",") if s.strip()),
     }
     (cache_dir / "meta.json").write_text(json.dumps(meta, indent=2))
 

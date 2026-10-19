@@ -39,6 +39,8 @@ from src.freq_branch.extractor import FREQ_FEATURE_DIM, FreqExtractor
 from src.fusion.fuse import FeatureFusion, FusionMode, GatedFusion
 from src.physics_branch.feature_vector import PHYSICS_FEATURE_DIM, PhysicsFeatureExtractor
 from src.prnu_branch.extractor import PRNU_FEATURE_DIM, PRNUExtractor
+from src.eval.names import normalize_source
+from src.train import collect_labeled_images
 
 
 def report_section(title: str):
@@ -55,39 +57,47 @@ def check_dataset_counts(data_dir: Path, expected_json: Path) -> bool:
     with open(expected_json, "r", encoding="utf-8") as f:
         expected = json.load(f)
 
-    test_root = data_dir / "test" if (data_dir / "test").exists() else data_dir
-    actual = {}
+    # Normalize expected keys to underscore-separated form
+    expected_normalized = {}
+    for key, count in expected.items():
+        expected_normalized[normalize_source(key)] = count
+
+    # Collect labeled images from test split
+    test_dir = data_dir / "test" if (data_dir / "test").exists() else data_dir
+    try:
+        samples = collect_labeled_images(test_dir)
+    except Exception as e:
+        print(f"[ERROR] Failed to collect labeled images: {e}")
+        return False
+
+    # Group by source and count
+    actual_counts = {}
+    for _, _, source in samples:
+        norm_source = normalize_source(source)
+        actual_counts[norm_source] = actual_counts.get(norm_source, 0) + 1
+
+    # Compare counts
     mismatches = []
-    total_actual = 0
+    total_actual = sum(actual_counts.values())
     total_expected = sum(expected.values())
 
-    for folder_key in expected:
-        parts = folder_key.split("/")
-        target_dir = test_root.joinpath(*parts)
-        if not target_dir.exists():
-            flat_name = folder_key.replace("/", "_")
-            target_dir = test_root / flat_name
-
-        count = 0
-        if target_dir.exists():
-            for root, _, files in os.walk(target_dir):
-                count += sum(1 for file in files if file.lower().endswith((".png", ".jpg", ".jpeg", ".webp")))
-        actual[folder_key] = count
-        total_actual += count
-        exp = expected[folder_key]
-        diff = count - exp
+    all_keys = set(expected_normalized.keys()) | set(actual_counts.keys())
+    for key in all_keys:
+        exp_count = expected_normalized.get(key, 0)
+        act_count = actual_counts.get(key, 0)
+        diff = act_count - exp_count
         if abs(diff) > 5:
-            mismatches.append((folder_key, count, exp, diff))
+            mismatches.append((key, act_count, exp_count, diff))
 
-    print(f"Total Folders: {len(expected)} | Total Actual Images: {total_actual:,} | Expected: {total_expected:,}")
+    print(f"Total Sources: {len(all_keys)} | Total Actual Images: {total_actual:,} | Expected: {total_expected:,}")
     if mismatches:
-        print(f"[FAIL] {len(mismatches)} folders have count mismatches (>5 difference):")
-        for k, act, exp, diff in mismatches[:10]:
-            print(f"  - {k}: actual={act}, expected={exp} (diff={diff:+d})")
+        print(f"[FAIL] {len(mismatches)} sources have count mismatches (>5 difference):")
+        for key, act, exp, diff in mismatches[:10]:
+            print(f"  - {key}: actual={act}, expected={exp} (diff={diff:+d})")
         if len(mismatches) > 10:
             print(f"  ... and {len(mismatches)-10} more.")
     else:
-        print("[OK] All folder counts match expected ForenSynths distribution (within ±2).")
+        print("[OK] All source counts match expected ForenSynths distribution (within ±5).")
     return not mismatches
 
 

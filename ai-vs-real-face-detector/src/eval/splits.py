@@ -8,11 +8,12 @@ from typing import Iterable, List, Optional, Sequence, Tuple
 
 import yaml
 
+def normalize_source(source: str) -> str:
+    return str(source).replace("\\", "/").strip().strip("/").lower()
+
 DEFAULT_SPLITS_PATH = Path(__file__).resolve().parents[2] / "eval" / "splits.yaml"
 
 
-def normalize_source(source: str) -> str:
-    return str(source).replace("\\", "/").strip().strip("/").lower()
 
 
 def matches_folder(source: str, folder: str) -> bool:
