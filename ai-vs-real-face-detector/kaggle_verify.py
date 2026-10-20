@@ -281,17 +281,30 @@ def check_feature_allclose(data_dir: Path, feature_cache: Path | None, device: t
             if not item_ok:
                 raise RuntimeError(f"unreadable sample: {samples[i][0]}")
             values = {"physics": physics.numpy(), "prnu": prnu.numpy(), "freq": freq.numpy()}
-            if semantic is not None:
+                        if semantic is not None:
                 x = pixels.to(device).permute(2, 0, 1).unsqueeze(0).float() / 255.0
                 mean = torch.tensor(semantic.mean, device=device).view(1, 3, 1, 1)
                 std = torch.tensor(semantic.std, device=device).view(1, 3, 1, 1)
-                with torch.no_grad():
+                # Mirror the cache builder: fp16 autocast on CUDA.
+                with torch.no_grad(), torch.autocast(
+                    device_type=device.type, dtype=torch.float16,
+                    enabled=(device.type == "cuda"),
+                ):
                     values["semantic"] = semantic((x - mean) / std).float().cpu().numpy()[0]
             for branch, live_value in values.items():
                 if branch not in z.files:
                     continue
-                same = np.allclose(z[branch][i], live_value, rtol=1e-4, atol=1e-5)
-                print(f"  {branch} sample {i}: {'OK' if same else 'FAIL'}")
+                cached = z[branch][i]
+                if branch == "semantic":
+                    # fp16 + different batch size => small numeric drift is expected.
+                    cos = float(np.dot(cached, live_value) /
+                                (np.linalg.norm(cached) * np.linalg.norm(live_value) + 1e-12))
+                    rel = float(np.abs(cached - live_value).max() / (np.abs(cached).max() + 1e-12))
+                    same = cos > 0.9995 and rel < 2e-2
+                    print(f"  semantic sample {i}: {'OK' if same else 'FAIL'} (cos={cos:.6f}, max_rel_err={rel:.2e})")
+                else:
+                    same = np.allclose(cached, live_value, rtol=1e-4, atol=1e-5)
+                    print(f"  {branch} sample {i}: {'OK' if same else 'FAIL'}")
                 ok = ok and bool(same)
         return ok
     except Exception as exc:
