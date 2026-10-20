@@ -281,7 +281,7 @@ def check_feature_allclose(data_dir: Path, feature_cache: Path | None, device: t
             if not item_ok:
                 raise RuntimeError(f"unreadable sample: {samples[i][0]}")
             values = {"physics": physics.numpy(), "prnu": prnu.numpy(), "freq": freq.numpy()}
-                        if semantic is not None:
+            if semantic is not None:
                 x = pixels.to(device).permute(2, 0, 1).unsqueeze(0).float() / 255.0
                 mean = torch.tensor(semantic.mean, device=device).view(1, 3, 1, 1)
                 std = torch.tensor(semantic.std, device=device).view(1, 3, 1, 1)
