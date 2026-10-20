@@ -2494,7 +2494,23 @@ def run_hybrid(
         Path(args.output_dir)
         / "hybrid_best.pt",
     )
+def fit_scalers_from_cache(cache_dir, max_samples: int, seed: int):
+    """Fit physics/PRNU scalers from cached train features (seconds, not hours)."""
+    from src.prnu_branch.extractor import PRNU_FEATURE_NAMES
 
+    z = np.load(Path(cache_dir) / "train.npz")
+    if "physics" not in z.files or "prnu" not in z.files:
+        raise KeyError("train.npz lacks physics/prnu arrays")
+    physics, prnu = z["physics"], z["prnu"]
+    n = len(physics)
+    if max_samples and n > max_samples:
+        idx = np.sort(np.random.default_rng(seed).choice(n, max_samples, replace=False))
+        physics, prnu = physics[idx], prnu[idx]
+    print(f"Fitting scalers from cache: {len(physics)} cached train rows")
+    return (
+        PhysicsNormalizer.fit(physics),
+        PhysicsNormalizer.fit(prnu, feature_names=list(PRNU_FEATURE_NAMES)),
+    )
 
 def run_full_hybrid(args, device) -> None:
     """Train/resume the four-modality model using explicit train/val/test sets."""
@@ -2542,6 +2558,12 @@ def run_full_hybrid(args, device) -> None:
                 max_samples=args.scaler_samples,
                 total_samples=args.known_train_size,
             )
+        elif getattr(args, "feature_cache", None) and args.data_source != "hf-stream":
+            physics_normalizer, prnu_normalizer = fit_scalers_from_cache(
+                args.feature_cache,
+                args.scaler_samples,
+                args.seed,
+            )
         else:
             # Path strings are inexpensive; images are decoded one at a time
             # in the fitter, and the DataLoader still owns the full dataset.
@@ -2551,6 +2573,7 @@ def run_full_hybrid(args, device) -> None:
                 max_samples=args.scaler_samples,
                 seed=args.seed,
             )
+
         save_physics_and_prnu_scaler_cache(
             scaler_cache_path,
             physics_normalizer,
