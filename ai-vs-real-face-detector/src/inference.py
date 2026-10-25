@@ -94,7 +94,9 @@ def load_model(checkpoint_path: str, device: torch.device):
             pretrained=False,
             normalize_physics=args.get("normalize_physics", False),
         )
-    model.load_state_dict(ckpt["model_state_dict"], strict=False)
+    missing, unexpected = model.load_state_dict(ckpt["model_state_dict"], strict=False)
+    if missing or unexpected:
+        raise RuntimeError(f"State dict mismatch for {mode}: missing={missing}, unexpected={unexpected}")
     from src.physics_branch.normalization import PhysicsNormalizer
     if mode == "full_hybrid" and isinstance(model, FullHybridClassifier):
         if ckpt.get("physics_normalizer"):
@@ -102,10 +104,20 @@ def load_model(checkpoint_path: str, device: torch.device):
                 PhysicsNormalizer.from_dict(ckpt["physics_normalizer"]),
                 PhysicsNormalizer.from_dict(ckpt["prnu_normalizer"]) if ckpt.get("prnu_normalizer") else None,
             )
-    elif mode in {"physics_only", "prnu_only"} and isinstance(model, BranchOnlyClassifier):
-        key = "physics_normalizer" if mode == "physics_only" else "prnu_normalizer"
+    elif mode in {"physics_only", "prnu_only", "freq_only"} and isinstance(model, BranchOnlyClassifier):
+        key = {
+            "physics_only": "physics_normalizer",
+            "prnu_only": "prnu_normalizer",
+            "freq_only": "freq_normalizer",
+        }[mode]
         if ckpt.get(key):
             model.set_normalizer(PhysicsNormalizer.from_dict(ckpt[key]))
+        else:
+            raise RuntimeError(
+                f"{mode} checkpoint has no '{key}'. It was trained on z-scored features, "
+                f"so it can't be evaluated without the fitted scaler. Retrain it, or inject "
+                f"a refit scaler into the checkpoint."
+            )    
     model.to(device)
     model.eval()
     return model, mode

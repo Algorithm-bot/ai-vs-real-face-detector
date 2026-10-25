@@ -1897,6 +1897,7 @@ def save_checkpoint(
     batch_idx: int = 0,
     epoch_complete: bool = True,
     best_acc: Optional[float] = None,
+    freq_normalizer: Optional[PhysicsNormalizer] = None,   # new
 ) -> None:
     """Save a resumable training checkpoint."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1924,6 +1925,9 @@ def save_checkpoint(
 
     if prnu_normalizer is not None:
         payload["prnu_normalizer"] = prnu_normalizer.to_dict()
+
+    if freq_normalizer is not None:
+        payload["freq_normalizer"] = freq_normalizer.to_dict()    
 
     torch.save(payload, path)
 

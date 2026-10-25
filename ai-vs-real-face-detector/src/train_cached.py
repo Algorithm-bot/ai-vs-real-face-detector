@@ -160,6 +160,8 @@ def main():
         model.set_normalizer(physics_norm)
     elif mode == "prnu_only":
         model.set_normalizer(prnu_norm)
+    elif mode == "freq_only":
+        model.set_normalizer(freq_norm)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
@@ -172,8 +174,9 @@ def main():
             path, model, optimizer, epoch, val_metrics, mode, args,
             physics_normalizer=physics_norm if mode == "physics_only" else None,
             prnu_normalizer=prnu_norm if mode == "prnu_only" else None,
+            freq_normalizer=freq_norm if mode == "freq_only" else None,
             scheduler=scheduler, best_acc=best_acc,
-        )
+    )
 
     n, bs = len(Xtr), args.batch_size
     for epoch in range(1, args.epochs + 1):
