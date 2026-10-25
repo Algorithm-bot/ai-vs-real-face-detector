@@ -1,5 +1,3 @@
-
-
 from __future__ import annotations
 from tqdm import tqdm
 import os
@@ -1632,9 +1630,15 @@ def _full_hybrid_epoch(
                     non_blocking=True,
                 )
 
-                prnu = batch["prnu"].to(
-                    device,
-                    non_blocking=True,
+                # prnu is off by default (branches: deep,physics,semantic,freq);
+                # only move it to the device when the dataset provides it.
+                prnu = (
+                    batch["prnu"].to(device, non_blocking=True)
+                    if "prnu" in batch else None
+                )
+                freq = (
+                    batch["freq"].to(device, non_blocking=True)
+                    if "freq" in batch else None
                 )
 
                 semantic = batch["semantic"].to(
@@ -1671,6 +1675,7 @@ def _full_hybrid_epoch(
                     physics,
                     prnu,
                     semantic,
+                    freq_features=freq,
                 )
             logits = logits.float()
 
