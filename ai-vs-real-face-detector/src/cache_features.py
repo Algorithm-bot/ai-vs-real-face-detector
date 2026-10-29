@@ -60,12 +60,31 @@ def _prnu_view(rgb, m=256):
 
 
 class FeatureDataset(Dataset):
-    def __init__(self, samples, preprocess_mode: str = "crop", crop_size: int = 224, enable_augment: bool = False, seed: int = 42):
+    def __init__(
+        self,
+        samples,
+        preprocess_mode: str = "crop",
+        crop_size: int = 224,
+        enable_augment: bool = False,
+        seed: int = 42,
+        p_blur: float = 0.5,
+        p_jpeg: float = 0.8,
+        p_downscale: float = 0.3,
+        max_sigma: float = 3.0,
+        min_quality: int = 30,
+        downscale_range: Tuple[float, float] = (0.5, 0.9),
+    ):
         self.samples = samples
         self.preprocess_mode = preprocess_mode
         self.crop_size = crop_size
         self.enable_augment = enable_augment
         self.seed = seed
+        self.p_blur = p_blur
+        self.p_jpeg = p_jpeg
+        self.p_downscale = p_downscale
+        self.max_sigma = max_sigma
+        self.min_quality = min_quality
+        self.downscale_range = downscale_range
         self.physics = None
         self.prnu = None
         self.freq = None
@@ -92,7 +111,17 @@ class FeatureDataset(Dataset):
             # Apply training augmentation at raw resolution if enabled (with deterministic path seeding)
             if self.enable_augment:
                 rgb, crop_rng = augment_raw_image(
-                    rgb, path=path, epoch=0, base_seed=self.seed, enable_augment=True
+                    rgb,
+                    path=path,
+                    epoch=0,
+                    base_seed=self.seed,
+                    enable_augment=True,
+                    p_blur=self.p_blur,
+                    p_jpeg=self.p_jpeg,
+                    p_downscale=self.p_downscale,
+                    max_sigma=self.max_sigma,
+                    min_quality=self.min_quality,
+                    downscale_range=self.downscale_range,
                 )
             else:
                 crop_rng = None
@@ -108,7 +137,7 @@ class FeatureDataset(Dataset):
             p = np.asarray(self.physics.extract(processed_rgb).vector, dtype=np.float32)
             q = np.asarray(self.prnu.extract(processed_rgb).vector, dtype=np.float32)
             from src.preprocess import preprocess_for_freq
-            f = np.asarray(self.freq.extract(preprocess_for_freq(rgb)).vector, dtype=np.float32)
+            f = np.asarray(self.freq.extract(preprocess_for_freq(rgb, crop_size=self.crop_size, mode=self.preprocess_mode)).vector, dtype=np.float32)
             v = processed_rgb  # 224x224x3 uint8 passed to ViT/CLIP
             ok = 1
         except Exception as exc:  # keep a long job alive; bad images are dropped later
@@ -141,12 +170,19 @@ def process_split(split, samples, encoder, device, cache_dir, args):
             continue
         chunk = samples[k * args.shard_size:(k + 1) * args.shard_size]
         enable_aug = getattr(args, "augment", False) and split == "train"
+        downscale_min, downscale_max = map(float, args.downscale_range.split(","))
         loader = DataLoader(
             FeatureDataset(
                 chunk,
                 preprocess_mode=getattr(args, "preprocess", "crop"),
                 enable_augment=enable_aug,
                 seed=args.seed,
+                p_blur=args.p_blur,
+                p_jpeg=args.p_jpeg,
+                p_downscale=args.p_downscale,
+                max_sigma=args.max_sigma,
+                min_quality=args.min_quality,
+                downscale_range=(downscale_min, downscale_max),
             ),
             batch_size=batch_size, shuffle=False,
             num_workers=args.workers, pin_memory=True,
@@ -250,10 +286,16 @@ def main():
     ap.add_argument("--batch-size", type=int, default=64,
                     help="Batch size for GPU semantic encoder forward pass")
     ap.add_argument("--no-semantic-pretrained", action="store_true")
-    ap.add_argument("--preprocess", choices=["crop", "resize"], default="crop",
-                    help="crop = random crop on train, center crop on test; resize = legacy")
+    ap.add_argument("--preprocess", choices=["crop", "resize", "center_crop", "no_resize", "aspect_crop"], default="crop",
+                    help="crop = random crop on train, center crop on test; center_crop = always center crop; no_resize = preserve original resolution; aspect_crop = aspect-preserving center crop; resize = legacy")
     ap.add_argument("--augment", "--augment-train", dest="augment", action="store_true",
-                    help="Apply training augmentation (Blur+JPEG) at raw resolution before crop")
+                    help="Apply training augmentation (Blur+JPEG+Downscale) at raw resolution before crop")
+    ap.add_argument("--p-blur", type=float, default=0.5, help="Probability of applying blur augmentation")
+    ap.add_argument("--p-jpeg", type=float, default=0.8, help="Probability of applying JPEG compression augmentation")
+    ap.add_argument("--p-downscale", type=float, default=0.3, help="Probability of applying downscale/upscale augmentation")
+    ap.add_argument("--max-sigma", type=float, default=3.0, help="Maximum sigma for Gaussian blur")
+    ap.add_argument("--min-quality", type=int, default=30, help="Minimum JPEG quality")
+    ap.add_argument("--downscale-range", type=str, default="0.5,0.9", help="Downscale range as min,max (e.g., 0.5,0.9)")
     ap.add_argument("--branches", default="deep,physics,semantic,freq",
                     help="Comma-separated branches cached (default: deep,physics,semantic,freq; prnu is off)")
     ap.add_argument("--splits", nargs="+", default=["train", "val", "test"])
@@ -287,6 +329,9 @@ def main():
     if args.max_train_images > 0:
         effective_per_class = max(1, args.max_train_images // 2)
 
+    # Parse downscale range
+    downscale_min, downscale_max = map(float, args.downscale_range.split(","))
+
     meta = {
         "semantic_model": args.semantic_model,
         "semantic_pretrained": not args.no_semantic_pretrained,
@@ -301,6 +346,13 @@ def main():
         "preprocess": args.preprocess,
         "crop_size": 224,
         "augment": bool(args.augment),
+        "p_blur": args.p_blur,
+        "p_jpeg": args.p_jpeg,
+        "p_downscale": args.p_downscale,
+        "max_sigma": args.max_sigma,
+        "min_quality": args.min_quality,
+        "downscale_min": downscale_min,
+        "downscale_max": downscale_max,
         "seed": args.seed,
         "subset_seed": getattr(args, "subset_seed", args.seed),
         "exclude_sources": tuple(s.strip() for s in args.exclude_sources.split(",") if s.strip()),

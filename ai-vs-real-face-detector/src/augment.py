@@ -1,5 +1,5 @@
 """
-Data augmentation for training: Blur and JPEG compression applied at RAW resolution.
+Data augmentation for training: Blur, JPEG compression, and downscale/upscale applied at RAW resolution.
 
 Provides deterministic seeding per image path so cached branches and live
 branches see identical augmented-then-cropped pixels for a given path.
@@ -42,16 +42,54 @@ def apply_jpeg(image: np.ndarray, quality: int) -> np.ndarray:
     return cv2.cvtColor(decimg, cv2.COLOR_BGR2RGB)
 
 
+def apply_downscale_upscale(
+    image: np.ndarray,
+    rng: Optional[np.random.RandomState] = None,
+    p_downscale: float = 0.3,
+    scale_range: Tuple[float, float] = (0.5, 0.9),
+) -> np.ndarray:
+    """
+    Downscale then upscale back to original size to simulate processing pipelines.
+
+    Args:
+        image: Input RGB image
+        rng: Random state for deterministic augmentation
+        p_downscale: Probability of applying downscale/upscale
+        scale_range: Range of downscale factors (min, max)
+
+    Returns:
+        Augmented image (same size as input)
+    """
+    if rng is None:
+        rng = np.random.RandomState()
+
+    if rng.rand() >= p_downscale:
+        return image
+
+    scale = float(rng.uniform(*scale_range))
+    h, w = image.shape[:2]
+    new_h, new_w = int(h * scale), int(w * scale)
+
+    # Downscale with INTER_AREA (better for downscaling)
+    down = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    # Upscale back with INTER_CUBIC (better for upscaling)
+    up = cv2.resize(down, (w, h), interpolation=cv2.INTER_CUBIC)
+
+    return up
+
+
 def apply_blur_jpeg_augmentation(
     image: np.ndarray,
     rng: Optional[np.random.RandomState] = None,
     p_blur: float = 0.5,
     p_jpeg: float = 0.5,
+    p_downscale: float = 0.3,
     max_sigma: float = 3.0,
     min_quality: int = 30,
+    downscale_range: Tuple[float, float] = (0.5, 0.9),
 ) -> np.ndarray:
     """
-    Apply Blur + JPEG compression at raw resolution.
+    Apply Blur + JPEG compression + Downscale/Upscale at raw resolution.
     Follows Wang et al. / ForenSynths training augmentation protocol.
     """
     if rng is None:
@@ -66,6 +104,8 @@ def apply_blur_jpeg_augmentation(
         quality = int(rng.randint(min_quality, 101))
         out = apply_jpeg(out, quality)
 
+    out = apply_downscale_upscale(out, rng, p_downscale, downscale_range)
+
     return out
 
 
@@ -76,11 +116,17 @@ def augment_raw_image(
     base_seed: int = 42,
     enable_augment: bool = True,
     deterministic: bool = True,
+    p_blur: float = 0.5,
+    p_jpeg: float = 0.8,
+    p_downscale: float = 0.3,
+    max_sigma: float = 3.0,
+    min_quality: int = 30,
+    downscale_range: Tuple[float, float] = (0.5, 0.9),
 ) -> Tuple[np.ndarray, np.random.RandomState]:
     """
     Augment raw image before cropping.
     If deterministic=True: uses path_to_seed(path, epoch, base_seed) so cached and live match.
-    If deterministic=False: draws fresh random blur/JPEG per epoch (fresh RNG).
+    If deterministic=False: draws fresh random blur/JPEG/downscale per epoch (fresh RNG).
     Returns (augmented_image, crop_rng).
     """
     if not enable_augment:
@@ -93,5 +139,14 @@ def augment_raw_image(
     else:
         rng = np.random.RandomState()
 
-    augmented = apply_blur_jpeg_augmentation(image, rng=rng)
+    augmented = apply_blur_jpeg_augmentation(
+        image,
+        rng=rng,
+        p_blur=p_blur,
+        p_jpeg=p_jpeg,
+        p_downscale=p_downscale,
+        max_sigma=max_sigma,
+        min_quality=min_quality,
+        downscale_range=downscale_range,
+    )
     return augmented, rng

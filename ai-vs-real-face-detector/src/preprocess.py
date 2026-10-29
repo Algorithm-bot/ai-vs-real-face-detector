@@ -7,6 +7,7 @@ Used consistently by training, cache_features.py, evaluate.py, and inference.
 from __future__ import annotations
 
 import hashlib
+from enum import Enum
 from typing import Any, Callable, Dict, Optional, Tuple, Union
 
 import cv2
@@ -19,18 +20,41 @@ IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 DEFAULT_CROP_SIZE = 224
 
+
+class PreprocessMode(str, Enum):
+    """Preprocessing modes for spatial alignment across branches."""
+    RESIZE = "resize"           # Legacy: force resize to crop_size x crop_size
+    CROP = "crop"               # Random crop (train) / center crop (eval)
+    CENTER_CROP = "center_crop" # Always center crop, no resize if large enough
+    NO_RESIZE = "no_resize"     # Preserve original resolution (for pixel-level branches)
+    ASPECT_CROP = "aspect_crop" # Aspect-preserving center crop, resize only if needed
+
 # Frequency branch rule: Always extract from the unresized center 224x224 crop
 # from src/preprocess.py to maintain consistency across resolutions.
-def preprocess_for_freq(image: np.ndarray, crop_size: int = DEFAULT_CROP_SIZE) -> np.ndarray:
-    """Preprocess image for frequency branch: uses unresized center 224x224 crop."""
+def preprocess_for_freq(
+    image: np.ndarray,
+    crop_size: int = DEFAULT_CROP_SIZE,
+    mode: str = "center_crop"
+) -> np.ndarray:
+    """
+    Preprocess image for frequency branch.
+
+    Args:
+        image: Input RGB image
+        crop_size: Target crop size
+        mode: Preprocessing mode (uses PreprocessMode values)
+
+    Returns:
+        Preprocessed image for frequency feature extraction
+    """
     if image.ndim == 2:
         image = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
     elif image.shape[2] == 4:
         image = image[:, :, :3]
-    h, w = image.shape[:2]
-    if h != crop_size or w != crop_size:
-        image = center_crop_numpy(image, crop_size=crop_size)
-    return image
+
+    # Use PreprocessPipeline for consistency with deep branch
+    pipeline = PreprocessPipeline(mode=mode, crop_size=crop_size, is_training=False)
+    return pipeline.preprocess_image(image)
 
 
 def pad_if_smaller(image: np.ndarray, target_size: int = DEFAULT_CROP_SIZE) -> np.ndarray:
@@ -80,12 +104,51 @@ def resize_numpy(image: np.ndarray, size: int = DEFAULT_CROP_SIZE) -> np.ndarray
     return cv2.resize(image, (size, size), interpolation=cv2.INTER_AREA)
 
 
+def aspect_preserving_center_crop(
+    image: np.ndarray,
+    crop_size: int = DEFAULT_CROP_SIZE
+) -> np.ndarray:
+    """
+    Aspect-preserving center crop:
+    - If image >= crop_size in both dimensions: extract center crop without resizing
+    - If smaller in either dimension: pad with edge reflection then center crop
+    - If larger but not square: center crop to min dimension, then resize to target
+    """
+    h, w = image.shape[:2]
+
+    if h >= crop_size and w >= crop_size:
+        # Image is large enough - extract center crop without resizing
+        # If not square, crop to square first (min dimension), then resize if needed
+        if h != w:
+            min_dim = min(h, w)
+            start_y = (h - min_dim) // 2
+            start_x = (w - min_dim) // 2
+            image = image[start_y:start_y + min_dim, start_x:start_x + min_dim]
+            if min_dim != crop_size:
+                image = cv2.resize(image, (crop_size, crop_size), interpolation=cv2.INTER_AREA)
+        else:
+            # Square and large enough - direct center crop
+            start_y = (h - crop_size) // 2
+            start_x = (w - crop_size) // 2
+            image = image[start_y:start_y + crop_size, start_x:start_x + crop_size]
+    else:
+        # Image is smaller than crop_size in at least one dimension
+        # Pad with edge reflection then center crop
+        image = pad_if_smaller(image, crop_size)
+        h, w = image.shape[:2]
+        start_y = (h - crop_size) // 2
+        start_x = (w - crop_size) // 2
+        image = image[start_y:start_y + crop_size, start_x:start_x + crop_size]
+
+    return image
+
+
 class PreprocessPipeline:
     """Shared preprocessing pipeline."""
 
     def __init__(
         self,
-        mode: str = "crop",  # "crop" or "resize" (legacy)
+        mode: str = "crop",  # "crop", "resize", "center_crop", "no_resize", "aspect_crop"
         crop_size: int = DEFAULT_CROP_SIZE,
         is_training: bool = False,
         seed: Optional[int] = None,
@@ -100,15 +163,34 @@ class PreprocessPipeline:
         image: np.ndarray,
         rng: Optional[np.random.RandomState] = None,
     ) -> np.ndarray:
-        """Preprocess an RGB uint8 image to (crop_size, crop_size, 3)."""
-        if self.mode == "resize":
+        """Preprocess an RGB uint8 image according to mode."""
+        mode = self.mode
+
+        if mode == PreprocessMode.RESIZE.value:
             return resize_numpy(image, self.crop_size)
-        
-        # Mode == "crop"
-        if self.is_training:
-            use_rng = rng or self.rng
-            return random_crop_numpy(image, self.crop_size, rng=use_rng)
+
+        elif mode == PreprocessMode.NO_RESIZE.value:
+            # Return original image unchanged (caller must handle downstream)
+            return image
+
+        elif mode == PreprocessMode.CENTER_CROP.value:
+            # Always center crop, no random component
+            return center_crop_numpy(image, self.crop_size)
+
+        elif mode == PreprocessMode.ASPECT_CROP.value:
+            # Aspect-preserving center crop
+            return aspect_preserving_center_crop(image, self.crop_size)
+
+        elif mode == PreprocessMode.CROP.value:
+            # Original behavior: random crop for training, center crop for eval
+            if self.is_training:
+                use_rng = rng or self.rng
+                return random_crop_numpy(image, self.crop_size, rng=use_rng)
+            else:
+                return center_crop_numpy(image, self.crop_size)
+
         else:
+            # Default to center crop for unknown modes
             return center_crop_numpy(image, self.crop_size)
 
 

@@ -22,6 +22,13 @@ FEATURE_AFFECTING_KEYS = (
     "crop_size",
     "max_train_images",
     "subset_seed",
+    "p_blur",
+    "p_jpeg",
+    "p_downscale",
+    "max_sigma",
+    "min_quality",
+    "downscale_min",
+    "downscale_max",
 )
 
 
@@ -64,6 +71,13 @@ def requested_meta_from_args(args: Any) -> Dict[str, Any]:
         "max_train_images": "max_train_images",
         "max_train_per_class": "max_train_per_class",
         "subset_seed": "subset_seed",
+        "p_blur": "p_blur",
+        "p_jpeg": "p_jpeg",
+        "p_downscale": "p_downscale",
+        "max_sigma": "max_sigma",
+        "min_quality": "min_quality",
+        "downscale_min": "downscale_min",
+        "downscale_max": "downscale_max",
     }
     for attr, key in mapping.items():
         if hasattr(args, attr) and getattr(args, attr) not in (None, ""):
@@ -73,6 +87,11 @@ def requested_meta_from_args(args: Any) -> Dict[str, Any]:
             if key == "semantic_layers" and not isinstance(value, str):
                 value = ",".join(str(v) for v in value)
             requested[key] = value
+    # Handle downscale_range -> downscale_min, downscale_max
+    if hasattr(args, "downscale_range") and getattr(args, "downscale_range"):
+        downscale_min, downscale_max = map(float, args.downscale_range.split(","))
+        requested["downscale_min"] = downscale_min
+        requested["downscale_max"] = downscale_max
     return requested
 
 

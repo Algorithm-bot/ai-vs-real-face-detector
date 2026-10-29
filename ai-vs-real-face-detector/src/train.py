@@ -396,6 +396,12 @@ def process_face_sample(
     enable_augment: bool = False,
     preprocess_mode: str = "crop",
     crop_size: int = 224,
+    p_blur: float = 0.5,
+    p_jpeg: float = 0.8,
+    p_downscale: float = 0.3,
+    max_sigma: float = 3.0,
+    min_quality: int = 30,
+    downscale_range: Tuple[float, float] = (0.5, 0.9),
 ) -> dict:
     from src.augment import augment_raw_image
     from src.preprocess import PreprocessPipeline
@@ -412,6 +418,12 @@ def process_face_sample(
             base_seed=seed,
             enable_augment=True,
             deterministic=has_cache,
+            p_blur=p_blur,
+            p_jpeg=p_jpeg,
+            p_downscale=p_downscale,
+            max_sigma=max_sigma,
+            min_quality=min_quality,
+            downscale_range=downscale_range,
         )
     else:
         crop_rng = None
@@ -435,9 +447,9 @@ def process_face_sample(
         else:
             if physics_extractor is None:
                 raise RuntimeError("Physics extractor is unavailable.")
-            # Use shared unresized center 224x224 crop for physics branch to ensure consistency with cached features.
+            # Use shared preprocessing for physics branch to ensure consistency with cached features.
             from src.preprocess import preprocess_for_freq
-            physics_vec = physics_extractor.extract(preprocess_for_freq(rgb)).vector
+            physics_vec = physics_extractor.extract(preprocess_for_freq(rgb, crop_size=crop_size, mode=preprocess_mode)).vector
     else:
         physics_vec = np.zeros(PHYSICS_FEATURE_DIM, dtype=np.float32)
 
@@ -479,7 +491,7 @@ def process_face_sample(
         else:
             from src.freq_branch.extractor import FreqExtractor
             from src.preprocess import preprocess_for_freq
-            freq_vec = np.asarray(FreqExtractor().extract(preprocess_for_freq(rgb)).vector, dtype=np.float32)
+            freq_vec = np.asarray(FreqExtractor().extract(preprocess_for_freq(rgb, crop_size=crop_size, mode=preprocess_mode)).vector, dtype=np.float32)
         sample["freq"] = torch.from_numpy(np.asarray(freq_vec, dtype=np.float32))
     return sample
 
@@ -872,6 +884,12 @@ class FaceBinaryDataset(Dataset):
             seed=getattr(self, "seed", 42),
             enable_augment=enable_augment,
             preprocess_mode=preprocess_mode,
+            p_blur=getattr(self, "p_blur", 0.5),
+            p_jpeg=getattr(self, "p_jpeg", 0.8),
+            p_downscale=getattr(self, "p_downscale", 0.3),
+            max_sigma=getattr(self, "max_sigma", 3.0),
+            min_quality=getattr(self, "min_quality", 30),
+            downscale_range=getattr(self, "downscale_range", (0.5, 0.9)),
         )
         sample["path"] = path
         return sample
@@ -1089,6 +1107,17 @@ class StreamingFaceBinaryDataset(IterableDataset):
                 self.physics_extractor, self.prnu_extractor, self.semantic_extractor,
                 self.use_physics, self.use_prnu, self.use_semantic,
                 use_freq=getattr(self, "use_freq", False),
+                path="",  # No path for streaming
+                epoch=getattr(self, "epoch", 0),
+                seed=getattr(self, "seed", 42),
+                enable_augment=getattr(self, "enable_augment", False),
+                preprocess_mode=getattr(self, "preprocess_mode", "crop"),
+                p_blur=getattr(self, "p_blur", 0.5),
+                p_jpeg=getattr(self, "p_jpeg", 0.8),
+                p_downscale=getattr(self, "p_downscale", 0.3),
+                max_sigma=getattr(self, "max_sigma", 3.0),
+                min_quality=getattr(self, "min_quality", 30),
+                downscale_range=getattr(self, "downscale_range", (0.5, 0.9)),
             )
 
 
@@ -1206,12 +1235,25 @@ def build_loaders(args, device: torch.device, folder_filter: Optional[List[str]]
             transform=transform,
         )
         if streaming:
-            return StreamingFaceBinaryDataset(
+            ds = StreamingFaceBinaryDataset(
                 repo_id=args.hf_dataset_repo,
                 split=split_name,
                 seed=args.seed,
                 **common,
             )
+            # Set augmentation attributes on streaming dataset
+            ds.epoch = 0
+            ds.enable_augment = getattr(args, "augment", False)
+            ds.preprocess_mode = getattr(args, "preprocess", "crop")
+            ds.seed = getattr(args, "seed", 42)
+            ds.p_blur = getattr(args, "p_blur", 0.5)
+            ds.p_jpeg = getattr(args, "p_jpeg", 0.8)
+            ds.p_downscale = getattr(args, "p_downscale", 0.3)
+            ds.max_sigma = getattr(args, "max_sigma", 3.0)
+            ds.min_quality = getattr(args, "min_quality", 30)
+            downscale_min, downscale_max = map(float, getattr(args, "downscale_range", "0.5,0.9").split(","))
+            ds.downscale_range = (downscale_min, downscale_max)
+            return ds
         return FaceBinaryDataset(
             root=args.data_dir,
             split=split_name,
@@ -1235,6 +1277,18 @@ def build_loaders(args, device: torch.device, folder_filter: Optional[List[str]]
 
     if split is not None:
         ds = make_timed_dataset(split, get_val_transforms(), folders=folder_filter)
+        # Set augmentation attributes on single-split dataset
+        ds.epoch = 0
+        ds.enable_augment = getattr(args, "augment", False)
+        ds.preprocess_mode = getattr(args, "preprocess", "crop")
+        ds.seed = getattr(args, "seed", 42)
+        ds.p_blur = getattr(args, "p_blur", 0.5)
+        ds.p_jpeg = getattr(args, "p_jpeg", 0.8)
+        ds.p_downscale = getattr(args, "p_downscale", 0.3)
+        ds.max_sigma = getattr(args, "max_sigma", 3.0)
+        ds.min_quality = getattr(args, "min_quality", 30)
+        downscale_min, downscale_max = map(float, getattr(args, "downscale_range", "0.5,0.9").split(","))
+        ds.downscale_range = (downscale_min, downscale_max)
         loader = DataLoader(
             ds,
             batch_size=args.batch_size,
@@ -1272,6 +1326,23 @@ def build_loaders(args, device: torch.device, folder_filter: Optional[List[str]]
 
     val_ds = make_timed_dataset("val", get_val_transforms())
 
+    # Set augmentation parameters on datasets
+    def set_augment_attrs(ds):
+        ds.epoch = getattr(ds, "epoch", 0)
+        ds.enable_augment = getattr(args, "augment", False)
+        ds.preprocess_mode = getattr(args, "preprocess", "crop")
+        ds.seed = getattr(args, "seed", 42)
+        ds.p_blur = getattr(args, "p_blur", 0.5)
+        ds.p_jpeg = getattr(args, "p_jpeg", 0.8)
+        ds.p_downscale = getattr(args, "p_downscale", 0.3)
+        ds.max_sigma = getattr(args, "max_sigma", 3.0)
+        ds.min_quality = getattr(args, "min_quality", 30)
+        downscale_min, downscale_max = map(float, getattr(args, "downscale_range", "0.5,0.9").split(","))
+        ds.downscale_range = (downscale_min, downscale_max)
+
+    set_augment_attrs(train_ds)
+    set_augment_attrs(val_ds)
+
     # --------------------------------------------------------
     # DataLoaders
     # --------------------------------------------------------
@@ -1299,6 +1370,7 @@ def build_loaders(args, device: torch.device, folder_filter: Optional[List[str]]
         return train_loader, val_loader
 
     test_ds = make_timed_dataset("test", get_val_transforms())
+    set_augment_attrs(test_ds)
     print(f"[dataset] total discovery: {dataset_discovery_seconds:.1f} sec")
     test_loader = DataLoader(
         test_ds, batch_size=args.batch_size, shuffle=False,
@@ -3302,9 +3374,27 @@ def parse_args():
 
     parser.add_argument(
         "--preprocess",
-        choices=["crop", "resize"],
+        choices=["crop", "resize", "center_crop", "no_resize", "aspect_crop"],
         default="crop",
-        help="crop = random 224x224 crop train, center crop eval; resize = legacy",
+        help="crop = random 224x224 crop train, center crop eval; center_crop = always center crop; no_resize = preserve original resolution; aspect_crop = aspect-preserving center crop; resize = legacy",
+    )
+    parser.add_argument(
+        "--p-blur", type=float, default=0.5, help="Probability of applying blur augmentation"
+    )
+    parser.add_argument(
+        "--p-jpeg", type=float, default=0.8, help="Probability of applying JPEG compression augmentation"
+    )
+    parser.add_argument(
+        "--p-downscale", type=float, default=0.3, help="Probability of applying downscale/upscale augmentation"
+    )
+    parser.add_argument(
+        "--max-sigma", type=float, default=3.0, help="Maximum sigma for Gaussian blur"
+    )
+    parser.add_argument(
+        "--min-quality", type=int, default=30, help="Minimum JPEG quality"
+    )
+    parser.add_argument(
+        "--downscale-range", type=str, default="0.5,0.9", help="Downscale range as min,max (e.g., 0.5,0.9)"
     )
     parser.add_argument(
         "--deep-no-down",
