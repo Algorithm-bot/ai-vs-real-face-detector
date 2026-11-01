@@ -31,7 +31,7 @@ def _load_rgb(path: str) -> np.ndarray:
 
 def fit_physics_scaler(
     sample_paths: Sequence[str],
-    max_samples: int = 20_000,
+    max_samples: int = 8000,
     seed: int = 42,
 ) -> PhysicsNormalizer:
     """Fit only the Physics scaler; do not calculate PRNU features."""
@@ -69,7 +69,7 @@ def fit_physics_scaler(
 
 def fit_physics_and_prnu_scalers(
     sample_paths: Sequence[str],
-    max_samples: int = 20_000,
+    max_samples: int = 8000,
     seed: int = 42,
 ) -> Tuple[PhysicsNormalizer, PhysicsNormalizer]:
     """Fit both Physics and PRNU scalers (for full_hybrid mode only)."""
@@ -118,7 +118,7 @@ def fit_physics_and_prnu_scalers(
 
 def fit_prnu_scaler(
     sample_paths: Sequence[str],
-    max_samples: int = 20_000,
+    max_samples: int = 8000,
     seed: int = 42,
 ) -> PhysicsNormalizer:
     """Fit only the PRNU scaler; do not calculate Physics features (for prnu_only mode)."""
