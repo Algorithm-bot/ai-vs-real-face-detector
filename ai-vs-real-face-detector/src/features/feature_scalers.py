@@ -72,7 +72,7 @@ def fit_physics_and_prnu_scalers(
     max_samples: int = 20_000,
     seed: int = 42,
 ) -> Tuple[PhysicsNormalizer, PhysicsNormalizer]:
-    """Fit both Physics and PRNU scalers."""
+    """Fit both Physics and PRNU scalers (for full_hybrid mode only)."""
 
     if max_samples < 0:
         raise ValueError("max_samples must be >= 0 (0 means all training images).")
@@ -114,6 +114,47 @@ def fit_physics_and_prnu_scalers(
     )
 
     return physics_norm, prnu_norm
+
+
+def fit_prnu_scaler(
+    sample_paths: Sequence[str],
+    max_samples: int = 20_000,
+    seed: int = 42,
+) -> PhysicsNormalizer:
+    """Fit only the PRNU scaler; do not calculate Physics features (for prnu_only mode)."""
+
+    if max_samples < 0:
+        raise ValueError("max_samples must be >= 0 (0 means all training images).")
+
+    paths = list(sample_paths)
+
+    if max_samples and len(paths) > max_samples:
+        rng = random.Random(seed)
+        paths = rng.sample(paths, max_samples)
+
+    prnu_extractor = PRNUExtractor()
+    prnu_vectors: List[np.ndarray] = []
+
+    try:
+        for path in tqdm(
+            paths,
+            total=len(paths),
+            desc="Fitting PRNU-only scaler",
+            unit="image",
+            dynamic_ncols=True,
+        ):
+            rgb = _load_rgb(path)
+            prnu_vectors.append(prnu_extractor.extract(rgb).vector)
+    finally:
+        pass  # PRNUExtractor doesn't have a close() method
+
+    if not prnu_vectors:
+        raise RuntimeError("No training samples available to fit PRNU scaler.")
+
+    return PhysicsNormalizer.fit(
+        np.stack(prnu_vectors, axis=0),
+        feature_names=list(PRNU_FEATURE_NAMES),
+    )
 
 
 def load_physics_and_prnu_scaler_cache(

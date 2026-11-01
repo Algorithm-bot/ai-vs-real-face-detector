@@ -2108,6 +2108,10 @@ def run_stage1(
     print("STAGE 1 — DEEP BRANCH TRAINING")
     print("=" * 60)
 
+    # Log which feature extractors are enabled
+    enabled_extractors = ["Deep (EfficientNet)"]
+    print(f"[Feature Extractors] Enabled: {', '.join(enabled_extractors)}")
+
     train_loader, val_loader, test_loader = build_loaders(args, device)
     selection_loader, selection_name = val_loader, "val"
     if not getattr(args, "legacy", False):
@@ -2339,6 +2343,10 @@ def run_hybrid(
     print("=" * 60)
     print("HYBRID TRAINING — DEEP + PHYSICS")
     print("=" * 60)
+
+    # Log which feature extractors are enabled
+    enabled_extractors = ["Deep (EfficientNet)", "Physics"]
+    print(f"[Feature Extractors] Enabled: {', '.join(enabled_extractors)}")
 
     train_loader, val_loader = build_loaders(
         args, device
@@ -2599,6 +2607,23 @@ def run_full_hybrid(args, device) -> None:
     print("\n" + "=" * 60)
     print("FULL HYBRID TRAINING — EFFICIENTNET + PHYSICS + PRNU + ViT")
     print("=" * 60)
+
+    # Log which feature extractors are enabled
+    branches_str = getattr(args, "branches", "deep,physics,semantic,freq")
+    if getattr(args, "legacy", False) and getattr(args, "branches", None) is None:
+        branches_str = "deep,physics,prnu,semantic"
+    branch_set = {b.strip().lower() for b in branches_str.split(",")} if isinstance(branches_str, str) else set(branches_str)
+    enabled_extractors = []
+    if "physics" in branch_set:
+        enabled_extractors.append("Physics")
+    if "prnu" in branch_set:
+        enabled_extractors.append("PRNU")
+    if "semantic" in branch_set:
+        enabled_extractors.append("Semantic (ViT)")
+    if "freq" in branch_set:
+        enabled_extractors.append("Frequency")
+    enabled_extractors.insert(0, "Deep (EfficientNet)")
+    print(f"[Feature Extractors] Enabled: {', '.join(enabled_extractors)}")
 
     print("[1/5] Building datasets")
     train_loader, val_loader, test_loader = build_loaders(args, device)
@@ -3096,6 +3121,16 @@ def run_branch_only(args, device) -> None:
     print(f"SINGLE-BRANCH TRAINING — {mode.upper()}")
     print("=" * 60)
 
+    # Log which feature extractors are enabled for this mode
+    enabled_extractors = []
+    if mode == "physics_only":
+        enabled_extractors.append("Physics")
+    elif mode == "prnu_only":
+        enabled_extractors.append("PRNU")
+    elif mode == "semantic_only":
+        enabled_extractors.append("Semantic (ViT)")
+    print(f"[Feature Extractors] Enabled: {', '.join(enabled_extractors)}")
+
     train_loader, val_loader, test_loader = build_loaders(args, device)
 
     physics_normalizer, prnu_normalizer = None, None
@@ -3103,6 +3138,8 @@ def run_branch_only(args, device) -> None:
     train_paths = [
         path for path, _, _ in train_loader.dataset.samples
     ]
+
+    scaler_started_at = time.perf_counter()
 
     if mode == "physics_only":
         from src.features.feature_scalers import fit_physics_scaler
@@ -3112,15 +3149,21 @@ def run_branch_only(args, device) -> None:
             max_samples=args.scaler_samples,
             seed=args.seed,
         )
+        print(f"[Scaler Fitting] Physics scaler fitted in {time.perf_counter() - scaler_started_at:.1f} seconds")
 
     elif mode == "prnu_only":
-        from src.features.feature_scalers import fit_physics_and_prnu_scalers
+        from src.features.feature_scalers import fit_prnu_scaler
 
-        _, prnu_normalizer = fit_physics_and_prnu_scalers(
+        prnu_normalizer = fit_prnu_scaler(
             train_paths,
             max_samples=args.scaler_samples,
             seed=args.seed,
         )
+        print(f"[Scaler Fitting] PRNU scaler fitted in {time.perf_counter() - scaler_started_at:.1f} seconds")
+
+    elif mode == "semantic_only":
+        # Semantic features don't require scaler fitting (ViT outputs are already normalized)
+        print(f"[Scaler Fitting] Semantic mode: no scaler fitting required (ViT features are pre-normalized)")
 
     dims = {
         "physics_only": PHYSICS_FEATURE_DIM,
