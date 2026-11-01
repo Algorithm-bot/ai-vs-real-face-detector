@@ -3097,11 +3097,30 @@ def run_branch_only(args, device) -> None:
     print("=" * 60)
 
     train_loader, val_loader, test_loader = build_loaders(args, device)
+
     physics_normalizer, prnu_normalizer = None, None
-    if mode in {"physics_only", "prnu_only"}:
+
+    train_paths = [
+        path for path, _, _ in train_loader.dataset.samples
+    ]
+
+    if mode == "physics_only":
+        from src.features.feature_scalers import fit_physics_scaler
+
+        physics_normalizer = fit_physics_scaler(
+            train_paths,
+            max_samples=args.scaler_samples,
+            seed=args.seed,
+        )
+
+    elif mode == "prnu_only":
         from src.features.feature_scalers import fit_physics_and_prnu_scalers
-        train_paths = [path for path, _, _ in train_loader.dataset.samples]
-        physics_normalizer, prnu_normalizer = fit_physics_and_prnu_scalers(train_paths)
+
+        _, prnu_normalizer = fit_physics_and_prnu_scalers(
+            train_paths,
+            max_samples=args.scaler_samples,
+            seed=args.seed,
+        )
 
     dims = {
         "physics_only": PHYSICS_FEATURE_DIM,
